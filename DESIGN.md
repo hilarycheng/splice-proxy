@@ -3,12 +3,12 @@
 ## Architecture
 
 ```
-Browser ←TCP→ Proxy Server ←RUDP/UDP→ Proxy Worker ←TCP→ Internet (via WireGuard VPN)
+Browser ←TCP→ Proxy Server ←RUDP/UDP→ Proxy Worker ←TCP→ Internet (via VPN)
                   ↕ UDP
-          WireGuard Client ←UDP forwarded→ WireGuard Server
+                VPN Client ←UDP forwarded→ Any UDP VPN Server
 ```
 
-**Purpose:** Route browser traffic through a remote VPN without passing the entire system through WireGuard. Only proxied traffic goes through the VPN tunnel. Company local PC traffic remains unaffected.
+**Purpose:** Route browser traffic through a remote VPN without passing the entire system through VPN. Only proxied traffic goes through the VPN tunnel. Company local PC traffic remains unaffected.
 
 **Constraint:** Due to Symantec Endpoint Protection on Windows, the container/WSL worker can only connect to the host on localhost/local IPs. TCP connections at scale break WSL networking, so UDP is used between server and worker with a custom Reliable UDP (RUDP) protocol.
 
@@ -40,21 +40,21 @@ Key features:
 - **HTTP proxy:** port 12346
 - **SOCKS5 proxy:** port 12348
 - **RUDP mux:** port 12347 (UDP, listens for worker connection)
-- **UDP forwarder:** port 12349 → Remote UDP Wireguard (Config from ini) (WireGuard relay)
+- **UDP forwarder:** port 12349 → VPN Server (via VPN UDP Mode)
 
 Features:
 - HTTP CONNECT tunnel for HTTPS
 - Plain HTTP forwarding (non-CONNECT)
 - Full SOCKS5 implementation (no-auth, IPv4/IPv6/domain, CONNECT only)
 - SOCKS5 bridges to worker via synthetic HTTP CONNECT
-- UDP session tracking with 5-minute timeout for WireGuard
+- UDP session tracking with 5-minute timeout for VPN
 - Relay goroutines don't prematurely close connections (SSE/streaming safe)
 - Pooled 32KB copy buffers via rudp.CopyBufPool
 
 ### proxy-worker.go — Runs on Linux only (container/WSL)
 - Connects to proxy-server via UDP (DialUDP)
 - Receives requests as RUDP streams
-- Dials remote targets via TCP (through WireGuard VPN)
+- Dials remote targets via TCP (through VPN)
 - Hello keepalive every 5 seconds
 - Relay goroutines don't prematurely close connections (SSE/streaming safe)
 - cleanRequest() strips proxy headers and absolutizes URLs for plain HTTP
@@ -66,7 +66,7 @@ Features:
 | 12346 | TCP      | HTTP proxy (browser connects)  |
 | 12347 | UDP      | RUDP mux (server ↔ worker)     |
 | 12348 | TCP      | SOCKS5 proxy (browser connects)|
-| 12349 | UDP      | WireGuard UDP forwarder        |
+| 12349 | UDP      | UDP forwarder                  |
 
 ## Static Build
 
@@ -109,10 +109,26 @@ No external dependencies. Go standard library only. Go 1.21+.
 ## For New Chat Sessions
 
 Upload these files to start working on this project:
+- `config/config.go` — config.ini library
 - `rudp/rudp.go` — the RUDP library
-- `proxy-server.go` — the proxy server (Windows/Linux)
-- `proxy-worker.go` — the proxy worker (Linux only)
-- `Makefile` — cross-platform static build
+- `server/proxy-server.go` — the proxy server (Windows/Linux)
+- `worker/proxy-worker.go` — the proxy worker (Linux only)
 - `go.mod` — module definition
 
 Include this summary document for context on architecture, decisions made, and bugs already fixed.
+
+## [Latest Release / Changelog] - Network Stability & Burst Recovery Update
+
+### Added
+* **Explicit OS Error Handling:** Added `syscall.EMSGSIZE` detection to `sendRaw` and `sendRawHeadroom` to catch and log silent MTU drops at the OS level instead of blindly retransmitting.
+
+### Fixed
+* **MTU Blackhole:** Reduced `ChunkSize` from 1400 to 1200 to safely clear VPN's 1420-byte MTU limit, preventing 100% packet loss on large HTTP POSTs and file uploads.
+* **Stream Teardown Panic:** Replaced `close(s.ch)` in `closeStream()` with a safe, non-blocking `drainLoop`. This eliminates fatal Go panics caused by race conditions when delayed network packets hit a closing stream.
+* **Out-of-Order Stream Killer:** Removed the hard `io.EOF` connection kill when the `s.ooo` buffer exceeds `chanSize`. The receiver now safely drops excess packets during massive downstream bursts (like LLM text generation) without severing the inner TCP connection.
+* **Out-of-Order Memory Leak:** Fixed a silent memory leak in `popNext()` by explicitly returning orphaned payload arrays to the `sync.Pool` before overwriting them with duplicate frames.
+
+### Changed
+* **Burst Recovery Speed:** Increased `maxRetransmitsPerTick` from 8 to 64, radically speeding up the congestion window's ability to recover from massive packet loss events.
+* **Timeout Tolerance:** Increased `writeIdleTimeout` from 30 seconds to 120 seconds to give the RUDP layer enough time to process and retransmit heavy downstream bursts.
+* **Congestion Control Smoothing:** Lowered `cwndFloor` to 4.0 and added an RTT-based cooldown timer to `lastLossTime`. This ensures the congestion window halves at most once per RTT during loss events, mirroring true TCP behavior.
