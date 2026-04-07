@@ -229,6 +229,16 @@ func main() {
 		m := rudp.NewMux(conn, false)
 		m.OnStream = handleWorkerRequest
 
+		go func() {
+			ticker := time.NewTicker(15 * time.Second)
+			defer ticker.Stop()
+			for range ticker.C {
+				buf := make([]byte, rudp.HdrSize)
+				buf[10] = rudp.MsgKeepAlive
+				conn.Write(buf)
+			}
+		}()
+
 		for {
 			m.SendHello()
 			time.Sleep(5 * time.Second)

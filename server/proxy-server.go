@@ -436,7 +436,7 @@ func main() {
 			// FIX: Prevent Symantec/Windows from dropping idle sessions during AI "thinking"
 			if tc, ok := conn.(*net.TCPConn); ok {
 				tc.SetKeepAlive(true)
-				tc.SetKeepAlivePeriod(10 * time.Second)
+				tc.SetKeepAlivePeriod(15 * time.Second)
 			}
 		}
 	}()

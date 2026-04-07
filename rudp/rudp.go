@@ -26,14 +26,14 @@ const (
 
 	WindowSize = 256
 
-	initialRTO     = 150 * time.Millisecond
-	minRTO         = 20 * time.Millisecond
+	initialRTO     = 50 * time.Millisecond
+	minRTO         = 10 * time.Millisecond
 	maxRTO         = 3 * time.Second
 	retransmitTick = 25 * time.Millisecond
 
 	writeIdleTimeout = 10 * time.Minute
 
-	chanSize = 4096
+	chanSize = 16384
 
 	maxBackoffShift = 5
 
@@ -987,12 +987,11 @@ func (m *Mux) readLoop() {
 				m.sendACK(reqID, frameID, rwnd)
 				s.touch()
 			default:
-				// Channel full — drop frame, BUT send ACK to update window (rwnd=0)
+				// Channel full: Drop data, but ACK to report zero window!
 				s.rxMu.Lock()
 				rwnd := s.calcRwnd()
 				s.rxMu.Unlock()
-				// ACK the last continuous good frame so sender pauses
-				m.sendACK(reqID, s.nextRx-1, rwnd)
+				m.sendACK(reqID, s.nextRx-1, rwnd) // Prevent TCP drop
 
 				if payload != nil {
 					putPayload(payload)
