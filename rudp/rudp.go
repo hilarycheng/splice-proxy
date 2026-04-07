@@ -31,7 +31,7 @@ const (
 	maxRTO         = 3 * time.Second
 	retransmitTick = 25 * time.Millisecond
 
-	writeIdleTimeout = 10 * time.Minute
+	writeIdleTimeout = 30 * time.Minute
 
 	chanSize = 16384
 
@@ -810,6 +810,9 @@ func (m *Mux) streamGCLoop() {
 				s := value.(*Stream)
 				lastAct := s.lastActivity.Load()
 				if lastAct < cutoffReap {
+					// >>> INJECT TRACE LOGGING HERE <<<
+					fmt.Printf("SYS | TRACE  | STRM-%04d Idle Timeout (%v) hit during AI thinking. Force closing.\n", s.id, StreamIdleTimeout)
+
 					m.closeStream(key.(uint32))
 				} else if lastAct < cutoffPing {
 					// FIX #8: touch on sender side too, so the stream
@@ -992,6 +995,9 @@ func (m *Mux) readLoop() {
 				rwnd := s.calcRwnd()
 				s.rxMu.Unlock()
 				m.sendACK(reqID, s.nextRx-1, rwnd) // Prevent TCP drop
+
+				// Inject TRACE logging here
+				fmt.Printf("SYS | TRACE  | STRM-%04d CH FULL! Sent Zero-Window ACK to pause AI stream.", reqID)
 
 				if payload != nil {
 					putPayload(payload)

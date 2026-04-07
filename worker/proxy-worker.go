@@ -189,7 +189,15 @@ func handleWorkerRequest(id uint32, s *rudp.Stream) {
 			} else {
 				remote.Close()
 			}
-			s.Close() // FIX: Propagate EOF back to proxy-server so browser doesn't hang
+
+			// FIX: Graceful Teardown. Give the RUDP background routines
+			// 2 seconds to guarantee the final packets of the AI's answer
+			// are ACKed by the server before destroying the stream.
+			// Inject TRACE logging here
+			logf("REQ-%05d | TRACE  | Google closed TCP. Holding RUDP 2s for final flush...", id)
+			time.Sleep(2 * time.Second)
+			logf("REQ-%05d | TRACE  | Final flush complete. Destroying RUDP stream.", id)
+			s.Close()
 		}()
 
 		go func() {
@@ -230,12 +238,16 @@ func main() {
 		m.OnStream = handleWorkerRequest
 
 		go func() {
-			ticker := time.NewTicker(15 * time.Second)
+			// FIX: Fire every 3 seconds to guarantee strict VPN/Docker
+			// firewalls never drop the UDP return path during long silences.
+			ticker := time.NewTicker(3 * time.Second)
 			defer ticker.Stop()
 			for range ticker.C {
 				buf := make([]byte, rudp.HdrSize)
 				buf[10] = rudp.MsgKeepAlive
 				conn.Write(buf)
+				// Inject TRACE logging here
+				logf("SYS | TRACE  | Sent 3s NAT UDP Keep-Alive pulse")
 			}
 		}()
 
