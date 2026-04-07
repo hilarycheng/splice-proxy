@@ -165,7 +165,7 @@ func handleWorkerRequest(id uint32, s *rudp.Stream) {
 
 	if tc, ok := remote.(*net.TCPConn); ok {
 		tc.SetNoDelay(true)
- 		tc.SetKeepAlive(true)
+		tc.SetKeepAlive(true)
 		tc.SetKeepAlivePeriod(15 * time.Second)
 	}
 
@@ -189,6 +189,7 @@ func handleWorkerRequest(id uint32, s *rudp.Stream) {
 			} else {
 				remote.Close()
 			}
+			s.Close() // FIX: Propagate EOF back to proxy-server so browser doesn't hang
 		}()
 
 		go func() {

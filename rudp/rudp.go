@@ -476,13 +476,13 @@ func (s *Stream) popNext(timeout time.Duration) (frame, bool) {
 				return f, true
 			}
 			if f.frameID > s.nextRx {
-                                // Safely overwrite duplicates to prevent memory leaks
+				// Safely overwrite duplicates to prevent memory leaks
 				if existing, exists := s.ooo[f.frameID]; exists {
 					if existing.payload != nil {
 						putPayload(existing.payload)
 					}
 				}
-				
+
 				// Only buffer if we have room. If full, drop it safely instead of killing the stream.
 				if len(s.ooo) < chanSize {
 					s.ooo[f.frameID] = f
@@ -606,7 +606,7 @@ func (m *Mux) sendRawHeadroom(reqID, frameID uint32, typ uint8, buf []byte) {
 	binary.BigEndian.PutUint32(buf[4:], frameID)
 	buf[8] = typ
 	binary.BigEndian.PutUint16(buf[9:], uint16(len(buf)-HdrSize))
-	
+
 	var err error
 	m.writeMu.Lock()
 	if m.isServer {
@@ -670,17 +670,17 @@ func (m *Mux) closeStream(id uint32) {
 		}
 		s.ready = nil
 		s.rxMu.Unlock()
-drainLoop:
-                for {
-                	select {
-                	case f := <-s.ch:
-                		if f.payload != nil {
-                			putPayload(f.payload)
-                		}
-                	default:
-                		break drainLoop
-                	}
-                }
+	drainLoop:
+		for {
+			select {
+			case f := <-s.ch:
+				if f.payload != nil {
+					putPayload(f.payload)
+				}
+			default:
+				break drainLoop
+			}
+		}
 	}
 }
 
@@ -987,7 +987,13 @@ func (m *Mux) readLoop() {
 				m.sendACK(reqID, frameID, rwnd)
 				s.touch()
 			default:
-				// Channel full — drop frame, do NOT ACK
+				// Channel full — drop frame, BUT send ACK to update window (rwnd=0)
+				s.rxMu.Lock()
+				rwnd := s.calcRwnd()
+				s.rxMu.Unlock()
+				// ACK the last continuous good frame so sender pauses
+				m.sendACK(reqID, s.nextRx-1, rwnd)
+
 				if payload != nil {
 					putPayload(payload)
 				}
