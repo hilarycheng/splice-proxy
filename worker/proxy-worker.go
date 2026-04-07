@@ -165,6 +165,8 @@ func handleWorkerRequest(id uint32, s *rudp.Stream) {
 
 	if tc, ok := remote.(*net.TCPConn); ok {
 		tc.SetNoDelay(true)
+ 		tc.SetKeepAlive(true)
+		tc.SetKeepAlivePeriod(15 * time.Second)
 	}
 
 	if method == "CONNECT" {

@@ -31,7 +31,7 @@ const (
 	maxRTO         = 3 * time.Second
 	retransmitTick = 25 * time.Millisecond
 
-	writeIdleTimeout = 120 * time.Second
+	writeIdleTimeout = 10 * time.Minute
 
 	chanSize = 4096
 
@@ -804,7 +804,7 @@ func (m *Mux) streamGCLoop() {
 			return
 		case now := <-ticker.C:
 			cutoffReap := now.UnixNano() - int64(StreamIdleTimeout)
-			cutoffPing := now.UnixNano() - int64(45*time.Second)
+			cutoffPing := now.UnixNano() - int64(15*time.Second)
 
 			m.streams.Range(func(key, value interface{}) bool {
 				s := value.(*Stream)
