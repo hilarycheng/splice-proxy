@@ -31,7 +31,7 @@ const (
 	maxRTO         = 3 * time.Second
 	retransmitTick = 25 * time.Millisecond
 
-	writeIdleTimeout = 30 * time.Minute
+	writeIdleTimeout = 2 * time.Hour
 
 	chanSize = 16384
 
@@ -51,7 +51,7 @@ const (
 	// this long is reaped by the Mux GC. 5 minutes is well above the
 	// popNext polling interval, so normal idle-direction timeouts won't
 	// trigger GC. Only truly abandoned streams are reaped.
-	StreamIdleTimeout = 5 * time.Minute
+	StreamIdleTimeout = 2 * time.Hour
 
 	// streamGCInterval: how often the Mux scans for idle streams.
 	streamGCInterval = 15 * time.Second
@@ -815,7 +815,7 @@ func (m *Mux) streamGCLoop() {
 
 					m.closeStream(key.(uint32))
 				} else if lastAct < cutoffPing {
-                                        // FIX: Do NOT call s.touch() here! It makes the stream immortal
+					// FIX: Do NOT call s.touch() here! It makes the stream immortal
 					// and defeats the 5-minute cutoffReap garbage collector.
 					m.sendRaw(s.id, 0, MsgKeepAlive, nil)
 				}
@@ -848,7 +848,7 @@ func (m *Mux) readLoop() {
 				return
 			default:
 			}
-                        // FIX: Prevent 100% CPU lockup on permanent socket errors
+			// FIX: Prevent 100% CPU lockup on permanent socket errors
 			time.Sleep(50 * time.Millisecond)
 			continue
 		}
@@ -946,12 +946,9 @@ func (m *Mux) readLoop() {
 		// ── KeepAlive ──
 		if typ == MsgKeepAlive {
 			if exists {
-				s := v.(*Stream)
-				s.touch()
-				s.rxMu.Lock()
-				rwnd := s.calcRwnd()
-				s.rxMu.Unlock()
-				m.sendACK(reqID, frameID, rwnd)
+				// Prevent the receiver side from garbage collecting
+				// an idle stream that is still sending KeepAlive.
+				v.(*Stream).touch()
 			}
 			continue
 		}
