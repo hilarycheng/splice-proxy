@@ -128,7 +128,13 @@ Include this summary document for context on architecture, decisions made, and b
 * **Out-of-Order Stream Killer:** Removed the hard `io.EOF` connection kill when the `s.ooo` buffer exceeds `chanSize`. The receiver now safely drops excess packets during massive downstream bursts (like LLM text generation) without severing the inner TCP connection.
 * **Out-of-Order Memory Leak:** Fixed a silent memory leak in `popNext()` by explicitly returning orphaned payload arrays to the `sync.Pool` before overwriting them with duplicate frames.
 
-### Changed
+### Changes: [2026-03-27] Congestion & Recovery Updates
 * **Burst Recovery Speed:** Increased `maxRetransmitsPerTick` from 8 to 64, radically speeding up the congestion window's ability to recover from massive packet loss events.
 * **Timeout Tolerance:** Increased `writeIdleTimeout` from 30 seconds to 120 seconds to give the RUDP layer enough time to process and retransmit heavy downstream bursts.
 * **Congestion Control Smoothing:** Lowered `cwndFloor` to 4.0 and added an RTT-based cooldown timer to `lastLossTime`. This ensures the congestion window halves at most once per RTT during loss events, mirroring true TCP behavior.
+
+### Changes: [2026-04-08] RUDP AI Stabilization Updates
+* **Zero-Window Backpressure:** Added explicit receiver window (`rwnd`) tracking and Zero-Window ACKs when the channel buffer is full, preventing Google's TCP servers from severing the connection during massive downstream AI text bursts.
+* **Idle NAT & TCP Timeouts:** Implemented 3-second UDP NAT keep-alive pulses, enabled OS-level TCP KeepAlives, and extended RUDP idle timeouts to 2 hours. This prevents WireGuard/Docker NAT and local browsers from silently dropping connections during long AI inference pauses (Pro Mode).
+* **Graceful Teardown:** Added a 2-second hold phase during the `CONNECT` teardown to guarantee the final in-flight AI text chunks are fully ACKed to the browser before destroying the local RUDP stream.
+* **Dead Socket CPU & FD Leaks:** Decoupled the stream garbage collector from artificial keep-alives to prevent file descriptor exhaustion ("immortal streams"), and introduced CPU yielding on dead sockets to prevent 100% core lockups when the VPN tunnel drops.
