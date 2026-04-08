@@ -251,9 +251,19 @@ func main() {
 			}
 		}()
 
-		for {
-			m.SendHello()
+                for {
+			// FIX: Check for socket errors to detect VPN/interface drops.
+			// If the route is dead, break the loop to trigger a fresh DialUDP.
+			buf := make([]byte, rudp.HdrSize)
+			buf[8] = rudp.MsgData // SendHello equivalent
+			if _, err := conn.Write(buf); err != nil {
+				logf("SYS | WARN  | Tunnel interface dead, reconnecting... (%v)", err)
+				break
+			}
 			time.Sleep(5 * time.Second)
 		}
+		
+		// Destroy the dead mux to free memory before reconnecting
+		m.Close()
 	}
 }

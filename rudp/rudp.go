@@ -815,12 +815,8 @@ func (m *Mux) streamGCLoop() {
 
 					m.closeStream(key.(uint32))
 				} else if lastAct < cutoffPing {
-					// FIX #8: touch on sender side too, so the stream
-					// that sent the keepalive also refreshes lastActivity.
-					// Without this, only the receiver's lastActivity updates
-					// (via the ACK reply), and the sender side can drift
-					// toward the reap cutoff during long SSE idle periods.
-					s.touch()
+                                        // FIX: Do NOT call s.touch() here! It makes the stream immortal
+					// and defeats the 5-minute cutoffReap garbage collector.
 					m.sendRaw(s.id, 0, MsgKeepAlive, nil)
 				}
 				return true
@@ -852,6 +848,8 @@ func (m *Mux) readLoop() {
 				return
 			default:
 			}
+                        // FIX: Prevent 100% CPU lockup on permanent socket errors
+			time.Sleep(50 * time.Millisecond)
 			continue
 		}
 		if n < HdrSize {
