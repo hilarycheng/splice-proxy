@@ -56,3 +56,22 @@ servers = 1.1.1.1:53, 1.0.0.1:53
 
 ; Cache TTL for DNS answers in seconds. 0 disables caching.
 cache_ttl_seconds = 300
+
+[hosts]
+; Custom IP overrides — bypass DNS for specific domains.
+; Exact matches take priority over wildcards. Longest wildcard suffix wins.
+; These overrides apply ONLY to traffic going through this proxy — they do
+; not affect the OS or other applications.
+;
+; Examples (uncomment and edit as needed):
+;
+; # Exact match
+; gemini.google.com    = 142.250.80.110
+; broken-dns-site.com  = 203.0.113.42
+;
+; # Wildcard — matches any subdomain of example.com, but NOT example.com itself
+; *.example.com        = 192.0.2.10
+;
+; # Internal services reachable through the VPN
+; api.internal         = 10.0.0.50
+; *.corp.local         = 10.0.0.1

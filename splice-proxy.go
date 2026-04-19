@@ -70,8 +70,12 @@ type Config struct {
 	WGKeepalive        int
 	WGMTU              int
 
-	DNSServers []string
+	DNSServers  []string
 	DNSCacheTTL time.Duration
+
+	// HostOverrides maps "host" or "*.suffix" to an IP string.
+	// Exact matches are checked first, then suffix wildcards (longest first).
+	HostOverrides map[string]string
 }
 
 func loadIni(path string) map[string]string {
@@ -172,6 +176,25 @@ func loadConfig(path string) (*Config, error) {
 			s += ":53"
 		}
 		c.DNSServers = append(c.DNSServers, s)
+	}
+
+	// Host overrides from [hosts] section — exact and wildcard (*.suffix).
+	// Any key under "hosts." in the flat map becomes an override.
+	c.HostOverrides = make(map[string]string)
+	for k, v := range m {
+		if !strings.HasPrefix(k, "hosts.") {
+			continue
+		}
+		host := strings.TrimPrefix(k, "hosts.")
+		v = strings.TrimSpace(v)
+		if host == "" || v == "" {
+			continue
+		}
+		// Validate the value is a parseable IP
+		if net.ParseIP(v) == nil {
+			return nil, fmt.Errorf("config: [hosts] %q = %q is not a valid IP", host, v)
+		}
+		c.HostOverrides[strings.ToLower(host)] = v
 	}
 
 	// Validate WG required fields
@@ -332,10 +355,63 @@ type Resolver struct {
 	servers []string
 	cache   *dnsCache
 	nextSrv atomic.Uint32
+
+	// Host overrides: exact match takes priority over wildcard.
+	// Wildcards are stored as "suffix" (e.g. ".example.com") and matched longest-first.
+	exactHosts    map[string]string // "gemini.google.com" -> "142.250.80.110"
+	wildcardHosts []wildcardEntry   // sorted by suffix length, descending
 }
 
-func newResolver(tnet *netstack.Net, servers []string, ttl time.Duration) *Resolver {
-	return &Resolver{tnet: tnet, servers: servers, cache: newDNSCache(ttl)}
+type wildcardEntry struct {
+	suffix string // ".example.com"
+	ip     string // "1.2.3.4"
+}
+
+func newResolver(tnet *netstack.Net, servers []string, ttl time.Duration, overrides map[string]string) *Resolver {
+	r := &Resolver{
+		tnet:       tnet,
+		servers:    servers,
+		cache:      newDNSCache(ttl),
+		exactHosts: make(map[string]string),
+	}
+	for host, ip := range overrides {
+		host = strings.ToLower(host)
+		if strings.HasPrefix(host, "*.") {
+			// "*.foo.com" → suffix ".foo.com" (matches a.foo.com, b.c.foo.com, but NOT foo.com itself)
+			r.wildcardHosts = append(r.wildcardHosts, wildcardEntry{
+				suffix: host[1:], // drop the '*'
+				ip:     ip,
+			})
+		} else {
+			r.exactHosts[host] = ip
+		}
+	}
+	// Longest suffix wins: sort descending by length
+	sortWildcardsLongestFirst(r.wildcardHosts)
+	return r
+}
+
+func sortWildcardsLongestFirst(ws []wildcardEntry) {
+	// Simple insertion sort; override lists are tiny.
+	for i := 1; i < len(ws); i++ {
+		for j := i; j > 0 && len(ws[j].suffix) > len(ws[j-1].suffix); j-- {
+			ws[j], ws[j-1] = ws[j-1], ws[j]
+		}
+	}
+}
+
+// matchOverride returns the overridden IP for host, or "" if no match.
+func (r *Resolver) matchOverride(host string) string {
+	host = strings.ToLower(host)
+	if ip, ok := r.exactHosts[host]; ok {
+		return ip
+	}
+	for _, w := range r.wildcardHosts {
+		if strings.HasSuffix(host, w.suffix) {
+			return w.ip
+		}
+	}
+	return ""
 }
 
 // resolverForGo builds a *net.Resolver that dials through WG.
@@ -365,6 +441,12 @@ func (r *Resolver) Resolve(ctx context.Context, host string) ([]string, error) {
 	if ip := net.ParseIP(host); ip != nil {
 		return []string{host}, nil
 	}
+
+	// Host override takes priority over cache and DNS
+	if ip := r.matchOverride(host); ip != "" {
+		return []string{ip}, nil
+	}
+
 	if cached, ok := r.cache.get(host); ok {
 		return cached, nil
 	}
@@ -438,10 +520,29 @@ func copyBuffered(dst io.Writer, src io.Reader) (int64, error) {
 	return n, err
 }
 
-// ─── Tunnel relay (bidirectional copy with half-close) ───────────────────────
+// ─── Tunnel relay (bidirectional copy) ───────────────────────────────────────
+//
+// SSE-safe: uses a small copy buffer (4 KB) so that tiny streaming chunks are
+// forwarded immediately instead of being batched into a 32 KB flush. Does NOT
+// half-close on one-direction completion — some servers (notably Google SSE
+// endpoints) treat the client's half-close as an end-of-stream signal and will
+// tear down the response. Instead we let both goroutines finish naturally and
+// close everything at the end.
 
 func relay(id uint32, label, host string, client net.Conn, remote net.Conn) {
 	logf("REQ-%05d | TUNNEL | open %s %s", id, label, host)
+
+	// When either side errors / closes, force the other side to unblock by
+	// closing it too. This is what ends the copy loops; we do NOT CloseWrite.
+	done := make(chan struct{})
+	var once sync.Once
+	closeAll := func() {
+		once.Do(func() {
+			close(done)
+			_ = client.Close()
+			_ = remote.Close()
+		})
+	}
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -449,27 +550,61 @@ func relay(id uint32, label, host string, client net.Conn, remote net.Conn) {
 	// client -> remote
 	go func() {
 		defer wg.Done()
-		copyBuffered(remote, client)
-		halfCloseWrite(remote)
+		copyStreaming(remote, client)
+		closeAll()
 	}()
 
-	// remote -> client
+	// remote -> client (this is the SSE-heavy direction for AI chat)
 	go func() {
 		defer wg.Done()
-		copyBuffered(client, remote)
-		halfCloseWrite(client)
+		copyStreaming(client, remote)
+		closeAll()
 	}()
 
 	wg.Wait()
-	_ = client.Close()
-	_ = remote.Close()
+	closeAll()
 	logf("REQ-%05d | TUNNEL | closed %s %s", id, label, host)
 }
 
-func halfCloseWrite(c net.Conn) {
-	type cw interface{ CloseWrite() error }
-	if x, ok := c.(cw); ok {
-		_ = x.CloseWrite()
+// copyStreaming is like io.Copy but with a small buffer (4 KB) so that SSE
+// and other chunked streams get forwarded chunk-by-chunk instead of batched.
+// Each Read on a TLS-over-TCP connection typically returns a single record;
+// a 4 KB buffer means we almost never coalesce two records into one write.
+func copyStreaming(dst io.Writer, src io.Reader) (int64, error) {
+	buf := make([]byte, 4096)
+	var total int64
+	for {
+		nr, rerr := src.Read(buf)
+		if nr > 0 {
+			nw, werr := dst.Write(buf[:nr])
+			total += int64(nw)
+			if werr != nil {
+				return total, werr
+			}
+			if nw < nr {
+				return total, io.ErrShortWrite
+			}
+		}
+		if rerr != nil {
+			if rerr == io.EOF {
+				return total, nil
+			}
+			return total, rerr
+		}
+	}
+}
+
+// tuneBrowserTCP configures the browser-facing TCP connection for low-latency
+// streaming. NoDelay disables Nagle's algorithm, which is critical for SSE —
+// without it, small (~200 byte) SSE chunks wait up to 200ms for more data to
+// accumulate before being sent, causing visible stutter in streamed LLM output.
+// KeepAlive prevents corporate firewalls / Symantec from silently dropping
+// idle CONNECT tunnels during long AI "thinking" pauses.
+func tuneBrowserTCP(c net.Conn) {
+	if tc, ok := c.(*net.TCPConn); ok {
+		_ = tc.SetNoDelay(true)
+		_ = tc.SetKeepAlive(true)
+		_ = tc.SetKeepAlivePeriod(15 * time.Second)
 	}
 }
 
@@ -591,10 +726,7 @@ func handleHTTP(r *Resolver, client net.Conn) {
 	defer client.Close()
 	id := nextReqID()
 
-	if tc, ok := client.(*net.TCPConn); ok {
-		tc.SetKeepAlive(true)
-		tc.SetKeepAlivePeriod(30 * time.Second)
-	}
+	tuneBrowserTCP(client)
 
 	raw, err := readRequest(client)
 	if err != nil {
@@ -643,10 +775,7 @@ func handleSOCKS5(r *Resolver, client net.Conn) {
 	defer client.Close()
 	id := nextReqID()
 
-	if tc, ok := client.(*net.TCPConn); ok {
-		tc.SetKeepAlive(true)
-		tc.SetKeepAlivePeriod(30 * time.Second)
-	}
+	tuneBrowserTCP(client)
 
 	// Greeting
 	hdr := make([]byte, 2)
@@ -810,6 +939,12 @@ func main() {
 	logf("SYS | INFO  | wg peer: %s", cfg.WGPeerEndpoint)
 	logf("SYS | INFO  | wg ip  : %v", cfg.WGLocalIPs)
 	logf("SYS | INFO  | dns    : %v (cache=%v)", cfg.DNSServers, cfg.DNSCacheTTL)
+	if len(cfg.HostOverrides) > 0 {
+		logf("SYS | INFO  | hosts  : %d override(s) loaded", len(cfg.HostOverrides))
+		for host, ip := range cfg.HostOverrides {
+			logf("SYS | INFO  |         %s -> %s", host, ip)
+		}
+	}
 
 	tnet, dev, err := setupWireGuard(cfg)
 	if err != nil {
@@ -818,7 +953,7 @@ func main() {
 	}
 	logf("SYS | READY | wireguard up")
 
-	resolver := newResolver(tnet, cfg.DNSServers, cfg.DNSCacheTTL)
+	resolver := newResolver(tnet, cfg.DNSServers, cfg.DNSCacheTTL, cfg.HostOverrides)
 
 	httpLn, err := net.Listen("tcp", cfg.HTTPListen)
 	if err != nil {
