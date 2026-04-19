@@ -1,0 +1,58 @@
+; ─────────────────────────────────────────────────────────────────────────────
+; splice-proxy config.ini
+;
+; Fill in the [wireguard] section with values from your WireGuard server.
+; Keys are in standard WG base64 format (44 chars, ending in '='), same as
+; what `wg genkey` / `wg pubkey` produce and what the reference wg-quick
+; .conf files use.
+; ─────────────────────────────────────────────────────────────────────────────
+
+[proxy]
+; Where the proxies listen for browser connections. Use 127.0.0.1 to keep
+; them local-only, or 0.0.0.0 to expose on LAN.
+http_listen   = 127.0.0.1:12346
+socks5_listen = 127.0.0.1:12348
+
+[wireguard]
+; Your client's private key (base64).
+private_key = PUT_YOUR_PRIVATE_KEY_HERE=
+
+; The VPN server's public key (base64).
+peer_public_key = PUT_SERVER_PUBLIC_KEY_HERE=
+
+; Optional pre-shared key (base64). Leave blank if not used.
+preshared_key =
+
+; Server endpoint (host:port or ip:port).
+peer_endpoint = 
+
+; This client's IP inside the VPN. Can be comma-separated for dual-stack
+; (e.g. "10.0.0.2, fd00::2"). CIDR suffix is optional and ignored.
+local_ip = 10.0.0.2/32
+
+; What traffic goes through the tunnel. For a "route everything" client,
+; leave as 0.0.0.0/0. For split-tunnel, list specific CIDRs.
+allowed_ips = 0.0.0.0/0, ::/0
+
+; Keepalive pulse in seconds. 25 is the standard value — keeps NAT mappings
+; alive through home routers and corporate firewalls.
+persistent_keepalive = 25
+
+; MTU inside the tunnel. 1420 is the WG default. Lower (e.g. 1280) if you're
+; tunneling over another tunnel or over networks with small MTU (mobile, etc).
+mtu = 1420
+
+[dns]
+; DNS servers, comma-separated. Queries are sent THROUGH the WG tunnel.
+; The host OS's DNS is not touched — corporate DNS, Symantec DNS interception,
+; and DNS leaks are all bypassed.
+;
+; Examples:
+;   Cloudflare:  1.1.1.1:53, 1.0.0.1:53
+;   Google:      8.8.8.8:53, 8.8.4.4:53
+;   Quad9:       9.9.9.9:53
+; Port :53 is added automatically if you omit it.
+servers = 1.1.1.1:53, 1.0.0.1:53
+
+; Cache TTL for DNS answers in seconds. 0 disables caching.
+cache_ttl_seconds = 300

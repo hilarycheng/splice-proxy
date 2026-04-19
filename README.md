@@ -3,11 +3,7 @@
 A lightweight, single-binary proxy system that routes browser traffic through a remote WireGuard VPN without affecting the host system's network. Only proxied traffic goes through the tunnel.
 
 ```
-Browser ──TCP──▶ Proxy Server ──RUDP/UDP──▶ Proxy Worker ──TCP──▶ Internet
-                      │                          │
-                 (Linux Host/Windows)       (WSL/container)
-                      │                          │
-                      └──UDP forward──▶ WireGuard Server
+Browser ──TCP──▶ Proxy Server ──▶  Wireguard Go ──TCP──▶ Internet
 ```
 
 ## Why
@@ -31,9 +27,7 @@ The server and worker communicate over UDP using a custom Reliable UDP (RUDP) pr
 | Port  | Protocol | Purpose                    |
 | ----- | -------- | -------------------------- |
 | 12346 | TCP      | HTTP proxy                 |
-| 12347 | UDP      | RUDP mux (server ↔ worker) |
 | 12348 | TCP      | SOCKS5 proxy               |
-| 12349 | UDP      | WireGuard UDP relay        |
 
 ## RUDP Protocol
 
@@ -56,6 +50,24 @@ Each RUDP stream implements `Read()` / `Write()` / `Close()` and behaves like a 
 - No HTTP keep-alive for plain HTTP requests (HTTPS tunnels handle it internally)
 - No automatic reconnection if the server restarts
 - Worker must be restarted manually after a server restart
+
+## Build
+
+Needs Go **1.21+** (1.22 recommended).
+
+```bash
+# One-time: fetch deps
+go mod tidy
+
+# Linux
+CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 go build -ldflags "-s -w" -o splice-proxy      splice-proxy.go
+
+# Windows
+CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -ldflags "-s -w" -o splice-proxy.exe  splice-proxy.go
+```
+
+`-ldflags "-s -w"` strips debug info (~30% smaller binary). `CGO_ENABLED=0`
+makes the binary fully static — no glibc / musl runtime dependency.
 
 ## Acknowledgments
 
