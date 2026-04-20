@@ -532,74 +532,66 @@ func copyBuffered(dst io.Writer, src io.Reader) (int64, error) {
 func relay(id uint32, label, host string, client net.Conn, clientReader io.Reader, remote net.Conn) {
 	logf("REQ-%05d | TUNNEL | open %s %s", id, label, host)
 
-	done := make(chan struct{})
-	var once sync.Once
+	// First-to-Fail: When one routine exits (error, EOF, or timeout),
+	// forcefully close both ends to unblock the other routine.
 	closeAll := func() {
-		once.Do(func() {
-			close(done)
-			_ = client.Close()
-			_ = remote.Close()
-		})
+		_ = client.Close()
+		_ = remote.Close()
 	}
-
-	var wg sync.WaitGroup
-	wg.Add(2)
 
 	// client -> remote
 	go func() {
-		defer wg.Done()
-		// Read from the stitched clientReader instead of raw socket
-		copyStreaming(remote, clientReader)
+		copyStreaming(remote, clientReader, remote, client)
+		closeAll()
 	}()
 
-	// remote -> client (SSE-heavy direction)
-	go func() {
-		defer wg.Done()
-		copyStreaming(client, remote)
-	}()
-
-	// Wait for BOTH directions to conclude naturally before forcing socket death
-	wg.Wait()
+	// remote -> client (Runs in main routine to block)
+	copyStreaming(client, remote, client, remote)
 	closeAll()
+
 	logf("REQ-%05d | TUNNEL | closed %s %s", id, label, host)
 }
 
-// copyStreaming is like io.Copy but with a small buffer (4 KB) so that SSE
-// and other chunked streams get forwarded chunk-by-chunk instead of batched.
-// Each Read on a TLS-over-TCP connection typically returns a single record;
-// a 4 KB buffer means we almost never coalesce two records into one write.
-func copyStreaming(dst io.Writer, src io.Reader) (int64, error) {
+// copyStreaming implements a sliding 10-minute idle timeout.
+// Every successful read pushes the deadline forward.
+func copyStreaming(dst io.Writer, src io.Reader, rawDst net.Conn, rawSrc net.Conn) {
 	buf := make([]byte, 4096)
-	var total int64
+	timeout := 10 * time.Minute
 	for {
+		// Reset dead man's switch
+		_ = rawSrc.SetReadDeadline(time.Now().Add(timeout))
+		_ = rawDst.SetWriteDeadline(time.Now().Add(timeout))
+
 		nr, rerr := src.Read(buf)
 		if nr > 0 {
 			nw, werr := dst.Write(buf[:nr])
-			total += int64(nw)
 			if werr != nil {
-				return total, werr
+				return
 			}
 			if nw < nr {
-				return total, io.ErrShortWrite
+				return
 			}
 		}
 		if rerr != nil {
-			if rerr == io.EOF {
-				return total, nil
-			}
-			return total, rerr
+			// Returns on real EOF, network reset, or idle timeout
+			return 
 		}
 	}
 }
 
-// tuneBrowserTCP configures the browser-facing TCP connection for low-latency
-// streaming. NoDelay disables Nagle's algorithm, which is critical for SSE —
-// without it, small (~200 byte) SSE chunks wait up to 200ms for more data to
-// accumulate before being sent, causing visible stutter in streamed LLM output.
-// KeepAlive prevents corporate firewalls / Symantec from silently dropping
-// idle CONNECT tunnels during long AI "thinking" pauses.
-func tuneBrowserTCP(c net.Conn) {
-	if tc, ok := c.(*net.TCPConn); ok {
+// tuneTCP configures TCP connections for low-latency streaming and Keep-Alives.
+// It uses interface assertion to handle both standard net.TCPConn and gVisor's gonet.TCPConn.
+func tuneTCP(c net.Conn) {
+	type keepAliveConn interface {
+		SetKeepAlive(bool) error
+		SetKeepAlivePeriod(time.Duration) error
+		SetNoDelay(bool) error
+	}
+	if kc, ok := c.(keepAliveConn); ok {
+		_ = kc.SetNoDelay(true)
+		_ = kc.SetKeepAlive(true)
+		_ = kc.SetKeepAlivePeriod(15 * time.Second)
+	} else if tc, ok := c.(*net.TCPConn); ok {
 		_ = tc.SetNoDelay(true)
 		_ = tc.SetKeepAlive(true)
 		_ = tc.SetKeepAlivePeriod(15 * time.Second)
@@ -633,7 +625,7 @@ func readRequest(rd io.Reader) ([]byte, []byte, error) {
 		buf = append(buf, body...)
 	}
 	
-	// Capture any bytes swallowed by bufio (like the TLS ClientHello)
+	// Capture the TLS ClientHello swallowed by bufio
 	leftover := make([]byte, br.Buffered())
 	io.ReadFull(br, leftover)
 	
@@ -727,9 +719,6 @@ func handleHTTP(r *Resolver, client net.Conn) {
 	defer client.Close()
 	id := nextReqID()
 
-	tuneBrowserTCP(client)
-
-	// Update to receive the leftover buffer
 	raw, leftover, err := readRequest(client)
 	if err != nil {
 		return
@@ -747,19 +736,23 @@ func handleHTTP(r *Resolver, client net.Conn) {
 		return
 	}
 
+	// Apply Keep-Alives to BOTH ends
+	tuneTCP(client)
+	tuneTCP(remote)
+
 	if method == "CONNECT" {
 		if _, err := client.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
 			remote.Close()
 			return
 		}
 		
-		// Reconstruct the stream: leftover buffer first, then raw socket
+		// Stitch the swallowed handshake bytes back to the front of the socket
 		var clientReader io.Reader = client
 		if len(leftover) > 0 {
 			clientReader = io.MultiReader(bytes.NewReader(leftover), client)
 		}
-		
-		// Pass the new composite reader to relay
+	        logf("REQ-%05d | HTTP   | %s %s | LeftOver : %d", id, method, host, leftover)
+
 		relay(id, "HTTP", host, client, clientReader, remote)
 	} else {
 		if _, err := remote.Write(cleanRequest(raw)); err != nil {
@@ -783,7 +776,8 @@ func handleSOCKS5(r *Resolver, client net.Conn) {
 	defer client.Close()
 	id := nextReqID()
 
-	tuneBrowserTCP(client)
+	// Apply Keep-Alives to the client side
+	tuneTCP(client)
 
 	// Greeting
 	hdr := make([]byte, 2)
@@ -875,13 +869,18 @@ func handleSOCKS5(r *Resolver, client net.Conn) {
 		return
 	}
 
+	// Apply Keep-Alives to the remote side
+	tuneTCP(remote)
+
 	// Success reply (bind addr/port = 0)
 	if _, err := client.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}); err != nil {
 		remote.Close()
 		return
 	}
 
-        relay(id, "SOCKS5", target, client, client, remote) // New
+	// SOCKS5 doesn't swallow bytes, so we pass the `client` socket twice
+	// (once as the raw socket, once as the io.Reader)
+	relay(id, "SOCKS5", target, client, client, remote)
 }
 
 // ─── Listeners ────────────────────────────────────────────────────────────────
