@@ -11,6 +11,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/binary"
@@ -528,12 +529,9 @@ func copyBuffered(dst io.Writer, src io.Reader) (int64, error) {
 // endpoints) treat the client's half-close as an end-of-stream signal and will
 // tear down the response. Instead we let both goroutines finish naturally and
 // close everything at the end.
-
-func relay(id uint32, label, host string, client net.Conn, remote net.Conn) {
+func relay(id uint32, label, host string, client net.Conn, clientReader io.Reader, remote net.Conn) {
 	logf("REQ-%05d | TUNNEL | open %s %s", id, label, host)
 
-	// When either side errors / closes, force the other side to unblock by
-	// closing it too. This is what ends the copy loops; we do NOT CloseWrite.
 	done := make(chan struct{})
 	var once sync.Once
 	closeAll := func() {
@@ -550,17 +548,17 @@ func relay(id uint32, label, host string, client net.Conn, remote net.Conn) {
 	// client -> remote
 	go func() {
 		defer wg.Done()
-		copyStreaming(remote, client)
-		closeAll()
+		// Read from the stitched clientReader instead of raw socket
+		copyStreaming(remote, clientReader)
 	}()
 
-	// remote -> client (this is the SSE-heavy direction for AI chat)
+	// remote -> client (SSE-heavy direction)
 	go func() {
 		defer wg.Done()
 		copyStreaming(client, remote)
-		closeAll()
 	}()
 
+	// Wait for BOTH directions to conclude naturally before forcing socket death
 	wg.Wait()
 	closeAll()
 	logf("REQ-%05d | TUNNEL | closed %s %s", id, label, host)
@@ -609,8 +607,7 @@ func tuneBrowserTCP(c net.Conn) {
 }
 
 // ─── HTTP request parsing ────────────────────────────────────────────────────
-
-func readRequest(rd io.Reader) ([]byte, error) {
+func readRequest(rd io.Reader) ([]byte, []byte, error) {
 	br := bufio.NewReaderSize(rd, 4096)
 	var buf []byte
 	var cLen int
@@ -618,7 +615,7 @@ func readRequest(rd io.Reader) ([]byte, error) {
 		line, err := br.ReadString('\n')
 		buf = append(buf, line...)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		lo := strings.ToLower(line)
 		if strings.HasPrefix(lo, "content-length:") {
@@ -631,11 +628,16 @@ func readRequest(rd io.Reader) ([]byte, error) {
 	if cLen > 0 {
 		body := make([]byte, cLen)
 		if _, err := io.ReadFull(br, body); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		buf = append(buf, body...)
 	}
-	return buf, nil
+	
+	// Capture any bytes swallowed by bufio (like the TLS ClientHello)
+	leftover := make([]byte, br.Buffered())
+	io.ReadFull(br, leftover)
+	
+	return buf, leftover, nil
 }
 
 func parseMethodHost(raw []byte) (method, host string) {
@@ -721,14 +723,14 @@ func cleanRequest(raw []byte) []byte {
 }
 
 // ─── HTTP proxy handler ───────────────────────────────────────────────────────
-
 func handleHTTP(r *Resolver, client net.Conn) {
 	defer client.Close()
 	id := nextReqID()
 
 	tuneBrowserTCP(client)
 
-	raw, err := readRequest(client)
+	// Update to receive the leftover buffer
+	raw, leftover, err := readRequest(client)
 	if err != nil {
 		return
 	}
@@ -750,14 +752,20 @@ func handleHTTP(r *Resolver, client net.Conn) {
 			remote.Close()
 			return
 		}
-		relay(id, "HTTP", host, client, remote)
+		
+		// Reconstruct the stream: leftover buffer first, then raw socket
+		var clientReader io.Reader = client
+		if len(leftover) > 0 {
+			clientReader = io.MultiReader(bytes.NewReader(leftover), client)
+		}
+		
+		// Pass the new composite reader to relay
+		relay(id, "HTTP", host, client, clientReader, remote)
 	} else {
 		if _, err := remote.Write(cleanRequest(raw)); err != nil {
 			remote.Close()
 			return
 		}
-		// For plain HTTP: copy response back, then close.
-		// We don't pipeline further requests (no keep-alive on plain HTTP side).
 		copyBuffered(client, remote)
 		remote.Close()
 		logf("REQ-%05d | DONE   | %s", id, host)
@@ -873,7 +881,7 @@ func handleSOCKS5(r *Resolver, client net.Conn) {
 		return
 	}
 
-	relay(id, "SOCKS5", target, client, remote)
+        relay(id, "SOCKS5", target, client, client, remote) // New
 }
 
 // ─── Listeners ────────────────────────────────────────────────────────────────
