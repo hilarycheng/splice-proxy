@@ -521,6 +521,14 @@ func copyBuffered(dst io.Writer, src io.Reader) (int64, error) {
 	return n, err
 }
 
+// closeWrite safely attempts a TCP Half-Close.
+// It signals that we are done sending data, but keeps the receive channel open.
+func closeWrite(c net.Conn) {
+	if cw, ok := c.(interface{ CloseWrite() error }); ok {
+		_ = cw.CloseWrite()
+	}
+}
+
 // ─── Tunnel relay (bidirectional copy) ───────────────────────────────────────
 //
 // SSE-safe: uses a small copy buffer (4 KB) so that tiny streaming chunks are
@@ -532,43 +540,49 @@ func copyBuffered(dst io.Writer, src io.Reader) (int64, error) {
 func relay(id uint32, label, host string, client net.Conn, clientReader io.Reader, remote net.Conn) {
 	logf("REQ-%05d | TUNNEL | open %s %s", id, label, host)
 
-	// First-to-Fail: When one routine exits (error, EOF, or timeout),
-	// forcefully close both ends to unblock the other routine.
-	closeAll := func() {
-		_ = client.Close()
-		_ = remote.Close()
-	}
+	var wg sync.WaitGroup
+	wg.Add(2)
 
-	// client -> remote
+	// Lane 1: Browser -> Remote (Upload)
+	// If the browser half-closes, this lane finishes quietly without destroying the socket.
 	go func() {
-		copyStreaming(remote, clientReader, remote, client)
-		closeAll()
+		defer wg.Done()
+		copyStreaming(remote, clientReader, remote, client, id, label, host, "From Browser")
+                closeWrite(remote)
 	}()
 
-	// remote -> client (Runs in main routine to block)
-	copyStreaming(client, remote, client, remote)
-	closeAll()
+	// Lane 2: Remote -> Browser (Download)
+	go func() {
+		defer wg.Done()
+		copyStreaming(client, remote, client, remote, id, label, host, "From Remote")
+                closeWrite(client)
+	}()
+
+	// Wait gracefully for BOTH directions to naturally conclude or hit the 10-minute timeout
+	wg.Wait()
+
+	// Safe, synchronized teardown
+	_ = client.Close()
+	_ = remote.Close()
 
 	logf("REQ-%05d | TUNNEL | closed %s %s", id, label, host)
 }
 
 // copyStreaming implements a sliding 10-minute idle timeout.
 // Every successful read pushes the deadline forward.
-func copyStreaming(dst io.Writer, src io.Reader, rawDst net.Conn, rawSrc net.Conn) {
-	buf := make([]byte, 4096)
-	timeout := 10 * time.Minute
+func copyStreaming(dst io.Writer, src io.Reader, rawDst net.Conn, rawSrc net.Conn, id uint32, label, host string, direction string) {
+	buf := make([]byte, 65536)
+	timeout := 3 * time.Minute
 	for {
 		// Reset dead man's switch
 		_ = rawSrc.SetReadDeadline(time.Now().Add(timeout))
 		_ = rawDst.SetWriteDeadline(time.Now().Add(timeout))
 
 		nr, rerr := src.Read(buf)
+	        logf("REQ-%05d | TUNNEL | copy %s %s, Direction %s, nr = %d, %s", id, label, host, direction, nr, rerr)
 		if nr > 0 {
-			nw, werr := dst.Write(buf[:nr])
+			_, werr := dst.Write(buf[:nr])
 			if werr != nil {
-				return
-			}
-			if nw < nr {
 				return
 			}
 		}
@@ -719,7 +733,10 @@ func handleHTTP(r *Resolver, client net.Conn) {
 	defer client.Close()
 	id := nextReqID()
 
+        // FIX: Prevent speculative pre-connections from freezing the proxy
+	_ = client.SetReadDeadline(time.Now().Add(15 * time.Second))
 	raw, leftover, err := readRequest(client)
+        _ = client.SetReadDeadline(time.Time{}) // Disable deadline so the tunnel takes over
 	if err != nil {
 		return
 	}
@@ -751,7 +768,6 @@ func handleHTTP(r *Resolver, client net.Conn) {
 		if len(leftover) > 0 {
 			clientReader = io.MultiReader(bytes.NewReader(leftover), client)
 		}
-	        logf("REQ-%05d | HTTP   | %s %s | LeftOver : %d", id, method, host, leftover)
 
 		relay(id, "HTTP", host, client, clientReader, remote)
 	} else {
@@ -776,6 +792,8 @@ func handleSOCKS5(r *Resolver, client net.Conn) {
 	defer client.Close()
 	id := nextReqID()
 
+        // FIX: Prevent speculative pre-connections from freezing the proxy
+	_ = client.SetReadDeadline(time.Now().Add(15 * time.Second))
 	// Apply Keep-Alives to the client side
 	tuneTCP(client)
 
@@ -878,6 +896,8 @@ func handleSOCKS5(r *Resolver, client net.Conn) {
 		return
 	}
 
+        // Disable deadline right before handing off to the relay
+	_ = client.SetReadDeadline(time.Time{})
 	// SOCKS5 doesn't swallow bytes, so we pass the `client` socket twice
 	// (once as the raw socket, once as the io.Reader)
 	relay(id, "SOCKS5", target, client, client, remote)
