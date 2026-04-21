@@ -548,7 +548,7 @@ func relay(id uint32, label, host string, client net.Conn, clientReader io.Reade
 	go func() {
 		defer wg.Done()
 		copyStreaming(remote, clientReader, remote, client, id, label, host, "From Browser")
-                closeWrite(remote)
+                // closeWrite(remote)
 	}()
 
 	// Lane 2: Remote -> Browser (Download)
