@@ -138,3 +138,22 @@ Include this summary document for context on architecture, decisions made, and b
 * **Idle NAT & TCP Timeouts:** Implemented 3-second UDP NAT keep-alive pulses, enabled OS-level TCP KeepAlives, and extended RUDP idle timeouts to 2 hours. This prevents WireGuard/Docker NAT and local browsers from silently dropping connections during long AI inference pauses (Pro Mode).
 * **Graceful Teardown:** Added a 2-second hold phase during the `CONNECT` teardown to guarantee the final in-flight AI text chunks are fully ACKed to the browser before destroying the local RUDP stream.
 * **Dead Socket CPU & FD Leaks:** Decoupled the stream garbage collector from artificial keep-alives to prevent file descriptor exhaustion ("immortal streams"), and introduced CPU yielding on dead sockets to prevent 100% core lockups when the VPN tunnel drops.
+
+### Changes: [2026-04-21] Observability for Long-Uptime Stalls
+
+### Added
+* **Active Relay Counter:** Added `activeRelays` atomic counter (inc/dec around `relay()`) to expose in-flight tunnel count in diagnostics.
+* **WG Stats Reader:** Added `readWGStats()` which parses `dev.IpcGet()` for last-handshake time and rx/tx byte counters. Defensive: returns zero-value on any parse failure, cannot panic the process.
+* **DNS Cache Size Accessor:** Added `dnsCache.size()` helper for diagnostic readout.
+* **Enriched `diagLoop`:** The existing 60-second tick now logs goroutines, active relays, DNS cache size, WG last-handshake age, and WG rx/tx byte delta Îíñ from goroutines alone.
+* **Tunnel Health Probe:** New `tunnelHealthLoop` opens a TCP handshake to `1.1.1.1:443` through the tunnel every 5 minutes, logs RTT on success, and emits a loud `SYS | ALERT` line after 3 consecutive failures. Observation-only Îíñ automatic WG rebuild.
+
+### Purpose
+Previous long-uptime stalls (proxy becomes unresponsive after hours/days, manual restart required) left no diagnostic trail. These additions are pure observability with zero impact on the request path, designed to identify which subsystem is dying on the next occurrence:
+
+* Growing `goroutines` / `relays` Îåõak in relay code
+* `wg_hs_age` climbing with `wg_rx_delta=0` ÎåõreGuard tunnel wedged
+* Health probe failing while traffic "works" Îåõisor netstack TCP table saturation
+* Health probe OK while real requests fail Îåõplication-layer bug
+
+A targeted fix will be designed once a real stall is captured with this telemetry.

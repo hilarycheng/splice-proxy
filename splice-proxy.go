@@ -350,6 +350,14 @@ func (c *dnsCache) put(host string, addrs []string) {
 	c.items[host] = dnsEntry{addrs: addrs, expires: time.Now().Add(c.ttl)}
 }
 
+// size returns the current number of cached entries (including expired ones
+// not yet evicted). Used for diagnostics only.
+func (c *dnsCache) size() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.items)
+}
+
 // Resolver resolves hostnames through the WG tunnel.
 type Resolver struct {
 	tnet    *netstack.Net
@@ -505,6 +513,10 @@ func nextReqID() uint32 {
 	}
 }
 
+// activeRelays tracks how many relay() goroutines are currently running.
+// Used by diagLoop for observability; zero behavior impact.
+var activeRelays atomic.Int64
+
 // ─── Copy buffer pool ────────────────────────────────────────────────────────
 
 var copyBufPool = sync.Pool{
@@ -538,6 +550,9 @@ func closeWrite(c net.Conn) {
 // tear down the response. Instead we let both goroutines finish naturally and
 // close everything at the end.
 func relay(id uint32, label, host string, client net.Conn, clientReader io.Reader, remote net.Conn) {
+	activeRelays.Add(1)
+	defer activeRelays.Add(-1)
+
 	logf("REQ-%05d | TUNNEL | open %s %s", id, label, host)
 
 	var wg sync.WaitGroup
@@ -548,7 +563,7 @@ func relay(id uint32, label, host string, client net.Conn, clientReader io.Reade
 	go func() {
 		defer wg.Done()
 		copyStreaming(remote, clientReader, remote, client, id, label, host, "From Browser")
-                // closeWrite(remote)
+                closeWrite(remote)
 	}()
 
 	// Lane 2: Remote -> Browser (Download)
@@ -936,12 +951,144 @@ func serveSOCKS5(ln net.Listener, r *Resolver) {
 }
 
 // ─── Diagnostics ──────────────────────────────────────────────────────────────
+//
+// Two loops, both observation-only (zero impact on request paths):
+//
+//   diagLoop         — every 60s, logs goroutine count, active relays,
+//                      DNS cache size, WG last-handshake age, WG rx/tx delta.
+//   tunnelHealthLoop — every 5 min, does a TCP handshake to 1.1.1.1:443
+//                      through the tunnel and logs RTT. After 3 consecutive
+//                      failures, emits a loud ALERT line. No auto-rebuild.
+//
+// Purpose: when the proxy goes stale after hours/days of uptime, the log
+// should show which subsystem died (goroutine leak, WG handshake wedge, or
+// netstack tcp stall) so a real fix can be designed.
 
-func diagLoop() {
+// wgStats holds a parsed snapshot of the peer section of `IpcGet()`.
+type wgStats struct {
+	lastHandshakeUnix int64 // seconds; 0 if never
+	rxBytes           uint64
+	txBytes           uint64
+}
+
+// readWGStats parses the first peer's stats from the WG device IPC dump.
+// Returns a zero-value struct on any parse failure — observability should
+// never be able to panic the process.
+func readWGStats(dev *device.Device) wgStats {
+	var s wgStats
+	raw, err := dev.IpcGet()
+	if err != nil {
+		return s
+	}
+	for _, line := range strings.Split(raw, "\n") {
+		line = strings.TrimSpace(line)
+		eq := strings.IndexByte(line, '=')
+		if eq < 0 {
+			continue
+		}
+		k, v := line[:eq], line[eq+1:]
+		switch k {
+		case "last_handshake_time_sec":
+			var n int64
+			fmt.Sscanf(v, "%d", &n)
+			s.lastHandshakeUnix = n
+		case "rx_bytes":
+			var n uint64
+			fmt.Sscanf(v, "%d", &n)
+			s.rxBytes = n
+		case "tx_bytes":
+			var n uint64
+			fmt.Sscanf(v, "%d", &n)
+			s.txBytes = n
+		}
+	}
+	return s
+}
+
+func diagLoop(dev *device.Device, resolver *Resolver) {
 	t := time.NewTicker(60 * time.Second)
 	defer t.Stop()
+
+	var lastRx, lastTx uint64
+	first := true
+
 	for range t.C {
-		logf("SYS | DIAG  | goroutines=%d", runtime.NumGoroutine())
+		s := readWGStats(dev)
+
+		var dRx, dTx uint64
+		if !first {
+			if s.rxBytes >= lastRx {
+				dRx = s.rxBytes - lastRx
+			}
+			if s.txBytes >= lastTx {
+				dTx = s.txBytes - lastTx
+			}
+		}
+		lastRx, lastTx = s.rxBytes, s.txBytes
+		first = false
+
+		var hsAge string
+		if s.lastHandshakeUnix == 0 {
+			hsAge = "never"
+		} else {
+			age := time.Since(time.Unix(s.lastHandshakeUnix, 0))
+			hsAge = age.Truncate(time.Second).String()
+		}
+
+		logf("SYS | DIAG  | goroutines=%d relays=%d dns_cache=%d wg_hs_age=%s wg_rx_delta=%d wg_tx_delta=%d",
+			runtime.NumGoroutine(),
+			activeRelays.Load(),
+			resolver.cache.size(),
+			hsAge,
+			dRx, dTx,
+		)
+	}
+}
+
+// tunnelHealthLoop probes the tunnel every 5 minutes by opening a TCP
+// connection to 1.1.1.1:443 through gVisor+WG, then immediately closing it.
+// Cheap, honest liveness signal. Logs RTT on success; on 3 consecutive
+// failures emits a loud ALERT line (but does NOT attempt to rebuild WG —
+// that decision waits until we've seen a real failure in the log).
+func tunnelHealthLoop(tnet *netstack.Net) {
+	const (
+		interval    = 5 * time.Minute
+		probeTarget = "1.1.1.1:443"
+		dialTimeout = 8 * time.Second
+		alertAfter  = 3
+	)
+
+	t := time.NewTicker(interval)
+	defer t.Stop()
+
+	failStreak := 0
+	for range t.C {
+		ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+		start := time.Now()
+		c, err := tnet.DialContext(ctx, "tcp", probeTarget)
+		rtt := time.Since(start)
+		cancel()
+
+		if err != nil {
+			failStreak++
+			logf("SYS | HEALTH| probe %s FAIL (streak=%d) after %v: %v",
+				probeTarget, failStreak, rtt.Truncate(time.Millisecond), err)
+			if failStreak == alertAfter {
+				logf("SYS | ALERT | tunnel appears unhealthy: %d consecutive probe failures — manual restart may be required",
+					failStreak)
+			}
+			continue
+		}
+		_ = c.Close()
+
+		if failStreak > 0 {
+			logf("SYS | HEALTH| probe %s OK rtt=%v (recovered after %d failure(s))",
+				probeTarget, rtt.Truncate(time.Millisecond), failStreak)
+		} else {
+			logf("SYS | HEALTH| probe %s OK rtt=%v",
+				probeTarget, rtt.Truncate(time.Millisecond))
+		}
+		failStreak = 0
 	}
 }
 
@@ -998,7 +1145,8 @@ func main() {
 
 	go serveHTTP(httpLn, resolver)
 	go serveSOCKS5(socksLn, resolver)
-	go diagLoop()
+	go diagLoop(dev, resolver)
+	go tunnelHealthLoop(tnet)
 
 	logf("SYS | READY | proxies listening")
 
