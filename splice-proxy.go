@@ -647,7 +647,7 @@ func relay(id uint32, label, host string, client net.Conn, clientReader io.Reade
 // copyStreaming implements a sliding idle timeout.
 // Every successful read pushes the deadline forward.
 func copyStreaming(dst io.Writer, src io.Reader, rawDst net.Conn, rawSrc net.Conn, id uint32, label, host string, direction string) {
-	buf := make([]byte, 4096)
+	buf := make([]byte, 16384)
 	timeout := 3 * time.Minute
 	for {
 		// Reset dead man's switch
