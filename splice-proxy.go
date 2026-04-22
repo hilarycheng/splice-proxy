@@ -24,16 +24,22 @@ import (
 	"net/netip"
 	"os"
 	"os/signal"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unsafe"
 
 	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/tun/netstack"
+
+	"gvisor.dev/gvisor/pkg/tcpip"
+	"gvisor.dev/gvisor/pkg/tcpip/stack"
+	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
 )
 
 // ─── Logging ──────────────────────────────────────────────────────────────────
@@ -245,6 +251,11 @@ func setupWireGuard(c *Config) (*netstack.Net, *device.Device, error) {
 		return nil, nil, fmt.Errorf("netstack create: %w", err)
 	}
 
+	// 1b. Tune gVisor TCP buffers BEFORE any connections are made.
+	// Default 32KB receive buffer causes zero-window stalls on fast bursts
+	// (e.g. Gemini fast mode). See Cloudflare slirpnetstack for precedent.
+	tuneNetstack(tnet)
+
 	// 2. Build the WG device
 	dev := device.NewDevice(tun, conn.NewDefaultBind(), &device.Logger{
 		Verbosef: (&wgLogger{}).Verbosef,
@@ -297,6 +308,56 @@ func setupWireGuard(c *Config) (*netstack.Net, *device.Device, error) {
 
 	_ = tun // returned implicitly via the device; keep reference silent
 	return tnet, dev, nil
+}
+
+// ─── Netstack TCP tuning ─────────────────────────────────────────────────────
+//
+// gVisor netstack defaults to ~32KB TCP receive buffers with no auto-tuning.
+// Under fast downstream bursts (Gemini fast mode, LLM streaming), the receive
+// buffer fills instantly, gVisor advertises zero window, and the remote server
+// resets or times out. The Linux kernel defaults to 128-256KB with auto-tuning
+// up to several MB — we replicate that here.
+//
+// netstack.Net hides the *stack.Stack in an unexported field. We extract it
+// via reflect+unsafe to call SetTransportProtocolOption. The field layout is:
+//
+//   type netTun struct {
+//       ep    *channel.Endpoint  // field 0
+//       stack *stack.Stack       // field 1
+//       ...
+//   }
+//   type Net = netTun  (type alias)
+//
+// If wireguard-go ever reorders these fields, getNetstackStack will panic at
+// startup — a clear signal to update the offset, not a silent corruption.
+
+func getNetstackStack(tnet *netstack.Net) *stack.Stack {
+	v := reflect.ValueOf(tnet).Elem()
+	f := v.Field(1) // netTun.stack is field index 1
+	return (*stack.Stack)(unsafe.Pointer(f.Pointer()))
+}
+
+func tuneNetstack(tnet *netstack.Net) {
+	s := getNetstackStack(tnet)
+
+	// Receive buffer: 4KB min, 256KB default, 4MB max
+	rcv := tcpip.TCPReceiveBufferSizeRangeOption{Min: 4096, Default: 262144, Max: 4 << 20}
+	s.SetTransportProtocolOption(tcp.ProtocolNumber, &rcv)
+
+	// Send buffer: 4KB min, 256KB default, 4MB max
+	snd := tcpip.TCPSendBufferSizeRangeOption{Min: 4096, Default: 262144, Max: 4 << 20}
+	s.SetTransportProtocolOption(tcp.ProtocolNumber, &snd)
+
+	// Enable receive buffer auto-tuning — gVisor dynamically grows buffers
+	// under load, matching Linux kernel tcp_moderate_rcvbuf behavior.
+	mod := tcpip.TCPModerateReceiveBufferOption(true)
+	s.SetTransportProtocolOption(tcp.ProtocolNumber, &mod)
+
+	// Enable SACK for better packet loss recovery through WG tunnel.
+	sack := tcpip.TCPSACKEnabled(true)
+	s.SetTransportProtocolOption(tcp.ProtocolNumber, &sack)
+
+	logf("SYS | INFO  | netstack tuned: rcv=256KB snd=256KB max=4MB auto-tune=on sack=on")
 }
 
 func dnsAddrs(servers []string) []netip.Addr {
@@ -563,14 +624,14 @@ func relay(id uint32, label, host string, client net.Conn, clientReader io.Reade
 	go func() {
 		defer wg.Done()
 		copyStreaming(remote, clientReader, remote, client, id, label, host, "From Browser")
-                closeWrite(remote)
+		closeWrite(remote)
 	}()
 
 	// Lane 2: Remote -> Browser (Download)
 	go func() {
 		defer wg.Done()
 		copyStreaming(client, remote, client, remote, id, label, host, "From Remote")
-                closeWrite(client)
+		closeWrite(client)
 	}()
 
 	// Wait gracefully for BOTH directions to naturally conclude or hit the 10-minute timeout
@@ -583,10 +644,10 @@ func relay(id uint32, label, host string, client net.Conn, clientReader io.Reade
 	logf("REQ-%05d | TUNNEL | closed %s %s", id, label, host)
 }
 
-// copyStreaming implements a sliding 10-minute idle timeout.
+// copyStreaming implements a sliding idle timeout.
 // Every successful read pushes the deadline forward.
 func copyStreaming(dst io.Writer, src io.Reader, rawDst net.Conn, rawSrc net.Conn, id uint32, label, host string, direction string) {
-	buf := make([]byte, 65536)
+	buf := make([]byte, 4096)
 	timeout := 3 * time.Minute
 	for {
 		// Reset dead man's switch
@@ -594,7 +655,6 @@ func copyStreaming(dst io.Writer, src io.Reader, rawDst net.Conn, rawSrc net.Con
 		_ = rawDst.SetWriteDeadline(time.Now().Add(timeout))
 
 		nr, rerr := src.Read(buf)
-	        logf("REQ-%05d | TUNNEL | copy %s %s, Direction %s, nr = %d, %s", id, label, host, direction, nr, rerr)
 		if nr > 0 {
 			_, werr := dst.Write(buf[:nr])
 			if werr != nil {
@@ -603,7 +663,7 @@ func copyStreaming(dst io.Writer, src io.Reader, rawDst net.Conn, rawSrc net.Con
 		}
 		if rerr != nil {
 			// Returns on real EOF, network reset, or idle timeout
-			return 
+			return
 		}
 	}
 }
@@ -653,11 +713,11 @@ func readRequest(rd io.Reader) ([]byte, []byte, error) {
 		}
 		buf = append(buf, body...)
 	}
-	
+
 	// Capture the TLS ClientHello swallowed by bufio
 	leftover := make([]byte, br.Buffered())
 	io.ReadFull(br, leftover)
-	
+
 	return buf, leftover, nil
 }
 
@@ -748,10 +808,10 @@ func handleHTTP(r *Resolver, client net.Conn) {
 	defer client.Close()
 	id := nextReqID()
 
-        // FIX: Prevent speculative pre-connections from freezing the proxy
+	// FIX: Prevent speculative pre-connections from freezing the proxy
 	_ = client.SetReadDeadline(time.Now().Add(15 * time.Second))
 	raw, leftover, err := readRequest(client)
-        _ = client.SetReadDeadline(time.Time{}) // Disable deadline so the tunnel takes over
+	_ = client.SetReadDeadline(time.Time{}) // Disable deadline so the tunnel takes over
 	if err != nil {
 		return
 	}
@@ -777,7 +837,7 @@ func handleHTTP(r *Resolver, client net.Conn) {
 			remote.Close()
 			return
 		}
-		
+
 		// Stitch the swallowed handshake bytes back to the front of the socket
 		var clientReader io.Reader = client
 		if len(leftover) > 0 {
@@ -807,7 +867,7 @@ func handleSOCKS5(r *Resolver, client net.Conn) {
 	defer client.Close()
 	id := nextReqID()
 
-        // FIX: Prevent speculative pre-connections from freezing the proxy
+	// FIX: Prevent speculative pre-connections from freezing the proxy
 	_ = client.SetReadDeadline(time.Now().Add(15 * time.Second))
 	// Apply Keep-Alives to the client side
 	tuneTCP(client)
@@ -911,7 +971,7 @@ func handleSOCKS5(r *Resolver, client net.Conn) {
 		return
 	}
 
-        // Disable deadline right before handing off to the relay
+	// Disable deadline right before handing off to the relay
 	_ = client.SetReadDeadline(time.Time{})
 	// SOCKS5 doesn't swallow bytes, so we pass the `client` socket twice
 	// (once as the raw socket, once as the io.Reader)
