@@ -357,12 +357,10 @@ func tuneNetstack(tnet *netstack.Net) {
 	sack := tcpip.TCPSACKEnabled(true)
 	s.SetTransportProtocolOption(tcp.ProtocolNumber, &sack)
 
-  // NEW: Explicitly set congestion control to BBR
-	// (BBR ignores minor packet loss/jitter from WireGuard and keeps the window open)
-	var cc tcpip.CongestionControlOption = "bbr"
+	var cc tcpip.CongestionControlOption = "cubic"
 	s.SetTransportProtocolOption(tcp.ProtocolNumber, &cc)
 
-	logf("SYS | INFO  | netstack tuned: rcv=256KB snd=256KB max=4MB auto-tune=on sack=on cc=bbr")
+	logf("SYS | INFO  | netstack tuned: rcv=256KB snd=256KB max=4MB auto-tune=on sack=on cc=cubic")
 }
 
 func dnsAddrs(servers []string) []netip.Addr {
