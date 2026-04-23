@@ -353,11 +353,16 @@ func tuneNetstack(tnet *netstack.Net) {
 	mod := tcpip.TCPModerateReceiveBufferOption(true)
 	s.SetTransportProtocolOption(tcp.ProtocolNumber, &mod)
 
-	// Enable SACK for better packet loss recovery through WG tunnel.
+  // Enable SACK for better packet loss recovery through WG tunnel.
 	sack := tcpip.TCPSACKEnabled(true)
 	s.SetTransportProtocolOption(tcp.ProtocolNumber, &sack)
 
-	logf("SYS | INFO  | netstack tuned: rcv=256KB snd=256KB max=4MB auto-tune=on sack=on")
+  // NEW: Explicitly set congestion control to BBR
+	// (BBR ignores minor packet loss/jitter from WireGuard and keeps the window open)
+	var cc tcpip.CongestionControlOption = "bbr"
+	s.SetTransportProtocolOption(tcp.ProtocolNumber, &cc)
+
+	logf("SYS | INFO  | netstack tuned: rcv=256KB snd=256KB max=4MB auto-tune=on sack=on cc=bbr")
 }
 
 func dnsAddrs(servers []string) []netip.Addr {
@@ -647,18 +652,29 @@ func relay(id uint32, label, host string, client net.Conn, clientReader io.Reade
 // copyStreaming implements a sliding idle timeout.
 // Every successful read pushes the deadline forward.
 func copyStreaming(dst io.Writer, src io.Reader, rawDst net.Conn, rawSrc net.Conn, id uint32, label, host string, direction string) {
-	buf := make([]byte, 16384)
+	// 32KB buffer is better optimized for fast HTTP/2 bursts
+	buf := make([]byte, 32768) 
 	timeout := 3 * time.Minute
-	for {
-		// Reset dead man's switch
-		_ = rawSrc.SetReadDeadline(time.Now().Add(timeout))
-		_ = rawDst.SetWriteDeadline(time.Now().Add(timeout))
+	
+	// Set initial deadlines OUTSIDE the hot loop
+	_ = rawSrc.SetReadDeadline(time.Now().Add(timeout))
+	_ = rawDst.SetWriteDeadline(time.Now().Add(timeout))
+	lastDeadlineUpdate := time.Now()
 
+	for {
 		nr, rerr := src.Read(buf)
 		if nr > 0 {
 			_, werr := dst.Write(buf[:nr])
 			if werr != nil {
 				return
+			}
+			
+			// Only push the dead man's switch forward periodically
+			// This prevents gVisor timer-mutex thrashing during fast bursts
+			if time.Since(lastDeadlineUpdate) > 10*time.Second {
+				_ = rawSrc.SetReadDeadline(time.Now().Add(timeout))
+				_ = rawDst.SetWriteDeadline(time.Now().Add(timeout))
+				lastDeadlineUpdate = time.Now()
 			}
 		}
 		if rerr != nil {
