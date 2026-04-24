@@ -353,14 +353,11 @@ func tuneNetstack(tnet *netstack.Net) {
 	mod := tcpip.TCPModerateReceiveBufferOption(true)
 	s.SetTransportProtocolOption(tcp.ProtocolNumber, &mod)
 
-  // Enable SACK for better packet loss recovery through WG tunnel.
+	// Enable SACK for better packet loss recovery through WG tunnel.
 	sack := tcpip.TCPSACKEnabled(true)
 	s.SetTransportProtocolOption(tcp.ProtocolNumber, &sack)
 
-	var cc tcpip.CongestionControlOption = "cubic"
-	s.SetTransportProtocolOption(tcp.ProtocolNumber, &cc)
-
-	logf("SYS | INFO  | netstack tuned: rcv=256KB snd=256KB max=4MB auto-tune=on sack=on cc=cubic")
+	logf("SYS | INFO  | netstack tuned: rcv=256KB snd=256KB max=4MB auto-tune=on sack=on")
 }
 
 func dnsAddrs(servers []string) []netip.Addr {
@@ -686,7 +683,7 @@ func bytesForDirection(a, b relayResult, direction string) int64 {
 	}
 	return 0
 }
-	
+
 // copyStreaming implements a long sliding idle timeout for AI/web streaming.
 // Every successful read pushes the deadline forward. Write failures are treated
 // as real tunnel failures and are logged/returned instead of being silently
@@ -703,7 +700,6 @@ func copyStreaming(dst io.Writer, src io.Reader, rawDst net.Conn, rawSrc net.Con
 		_ = rawSrc.SetReadDeadline(deadline)
 		_ = rawDst.SetWriteDeadline(deadline)
 
-	for {
 		nr, rerr := src.Read(buf)
 		if nr > 0 {
 			written := 0
@@ -719,14 +715,6 @@ func copyStreaming(dst io.Writer, src io.Reader, rawDst net.Conn, rawSrc net.Con
 				if nw == 0 {
 					return relayResult{direction: direction, bytes: total, duration: time.Since(started), err: io.ErrShortWrite}
 				}
-			}
-			
-			// Only push the dead man's switch forward periodically
-			// This prevents gVisor timer-mutex thrashing during fast bursts
-			if time.Since(lastDeadlineUpdate) > 10*time.Second {
-				_ = rawSrc.SetReadDeadline(time.Now().Add(timeout))
-				_ = rawDst.SetWriteDeadline(time.Now().Add(timeout))
-				lastDeadlineUpdate = time.Now()
 			}
 		}
 		if rerr != nil {
