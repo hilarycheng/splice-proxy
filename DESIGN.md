@@ -157,3 +157,17 @@ Previous long-uptime stalls (proxy becomes unresponsive after hours/days, manual
 * Health probe OK while real requests fail Îåõplication-layer bug
 
 A targeted fix will be designed once a real stall is captured with this telemetry.
+
+## Changes: [2026-04-24] Gemini Streaming Stability Patch
+
+### Fixed
+* Stopped ignoring relay `Write()` errors and short writes, preventing silent stream corruption.
+* Increased CONNECT tunnel idle timeout from **3 minutes** to **30 minutes** for long AI response pauses.
+* Removed aggressive TCP half-close behavior that could prematurely end Gemini/Google streaming responses.
+* Added relay shutdown logs with direction, byte count, duration, and failure reason.
+
+### Changed
+* CONNECT tunnels now close both sides together after relay completion, safer for long-lived HTTPS/SSE-style streams.
+
+### Expected Result
+Improves Gemini Web stability during long prompts and reduces JetBrains AI/plugin `Premature EOF` errors caused by hidden relay failures.

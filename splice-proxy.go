@@ -615,58 +615,112 @@ func closeWrite(c net.Conn) {
 // endpoints) treat the client's half-close as an end-of-stream signal and will
 // tear down the response. Instead we let both goroutines finish naturally and
 // close everything at the end.
+type relayResult struct {
+	direction string
+	bytes     int64
+	duration  time.Duration
+	err       error
+}
+
+func (r relayResult) reason() string {
+	if r.err == nil {
+		return "clean EOF"
+	}
+	if ne, ok := r.err.(net.Error); ok && ne.Timeout() {
+		return "idle timeout"
+	}
+	if errors.Is(r.err, io.EOF) {
+		return "EOF"
+	}
+	return r.err.Error()
+}
+
+// relay copies a CONNECT/SOCKS5 tunnel in both directions.
+//
+// Gemini/Google AI traffic is very sensitive to premature TCP half-closes:
+// if the proxy sends FIN on the upload side while the model is still streaming
+// down, some upstream endpoints treat it as an end-of-stream signal and stop the
+// response. For that reason this relay does NOT CloseWrite() when one direction
+// finishes. It waits for both directions, with long sliding idle deadlines, and
+// then closes both sockets together.
 func relay(id uint32, label, host string, client net.Conn, clientReader io.Reader, remote net.Conn) {
 	activeRelays.Add(1)
 	defer activeRelays.Add(-1)
 
+	started := time.Now()
 	logf("REQ-%05d | TUNNEL | open %s %s", id, label, host)
 
-	var wg sync.WaitGroup
-	wg.Add(2)
+	results := make(chan relayResult, 2)
 
-	// Lane 1: Browser -> Remote (Upload)
-	// If the browser half-closes, this lane finishes quietly without destroying the socket.
 	go func() {
-		defer wg.Done()
-		copyStreaming(remote, clientReader, remote, client, id, label, host, "From Browser")
-		closeWrite(remote)
+		results <- copyStreaming(remote, clientReader, remote, client, id, label, host, "browser->remote")
 	}()
 
-	// Lane 2: Remote -> Browser (Download)
 	go func() {
-		defer wg.Done()
-		copyStreaming(client, remote, client, remote, id, label, host, "From Remote")
-		closeWrite(client)
+		results <- copyStreaming(client, remote, client, remote, id, label, host, "remote->browser")
 	}()
 
-	// Wait gracefully for BOTH directions to naturally conclude or hit the 10-minute timeout
-	wg.Wait()
+	// Wait for both directions. We intentionally do not half-close either side
+	// after the first direction exits; this is safer for Google/Gemini streaming.
+	r1 := <-results
+	logf("REQ-%05d | TUNNEL | lane done %s %s bytes=%d dur=%s reason=%s",
+		id, label, r1.direction, r1.bytes, r1.duration.Truncate(time.Millisecond), r1.reason())
 
-	// Safe, synchronized teardown
+	r2 := <-results
+	logf("REQ-%05d | TUNNEL | lane done %s %s bytes=%d dur=%s reason=%s",
+		id, label, r2.direction, r2.bytes, r2.duration.Truncate(time.Millisecond), r2.reason())
+
 	_ = client.Close()
 	_ = remote.Close()
 
-	logf("REQ-%05d | TUNNEL | closed %s %s", id, label, host)
+	logf("REQ-%05d | TUNNEL | closed %s %s total=%s up=%d down=%d",
+		id, label, host, time.Since(started).Truncate(time.Millisecond),
+		bytesForDirection(r1, r2, "browser->remote"),
+		bytesForDirection(r1, r2, "remote->browser"))
 }
 
-// copyStreaming implements a sliding idle timeout.
-// Every successful read pushes the deadline forward.
-func copyStreaming(dst io.Writer, src io.Reader, rawDst net.Conn, rawSrc net.Conn, id uint32, label, host string, direction string) {
-	// 32KB buffer is better optimized for fast HTTP/2 bursts
-	buf := make([]byte, 32768) 
-	timeout := 3 * time.Minute
+func bytesForDirection(a, b relayResult, direction string) int64 {
+	if a.direction == direction {
+		return a.bytes
+	}
+	if b.direction == direction {
+		return b.bytes
+	}
+	return 0
+}
 	
-	// Set initial deadlines OUTSIDE the hot loop
-	_ = rawSrc.SetReadDeadline(time.Now().Add(timeout))
-	_ = rawDst.SetWriteDeadline(time.Now().Add(timeout))
-	lastDeadlineUpdate := time.Now()
+// copyStreaming implements a long sliding idle timeout for AI/web streaming.
+// Every successful read pushes the deadline forward. Write failures are treated
+// as real tunnel failures and are logged/returned instead of being silently
+// ignored, which prevents hidden truncated TLS streams and JetBrains/Gemini EOFs.
+func copyStreaming(dst io.Writer, src io.Reader, rawDst net.Conn, rawSrc net.Conn, id uint32, label, host string, direction string) relayResult {
+	const idleTimeout = 30 * time.Minute
+
+	started := time.Now()
+	buf := make([]byte, 4096)
+	var total int64
+
+	for {
+		deadline := time.Now().Add(idleTimeout)
+		_ = rawSrc.SetReadDeadline(deadline)
+		_ = rawDst.SetWriteDeadline(deadline)
 
 	for {
 		nr, rerr := src.Read(buf)
 		if nr > 0 {
-			_, werr := dst.Write(buf[:nr])
-			if werr != nil {
-				return
+			written := 0
+			for written < nr {
+				nw, werr := dst.Write(buf[written:nr])
+				if nw > 0 {
+					written += nw
+					total += int64(nw)
+				}
+				if werr != nil {
+					return relayResult{direction: direction, bytes: total, duration: time.Since(started), err: fmt.Errorf("write after %d/%d bytes of chunk: %w", written, nr, werr)}
+				}
+				if nw == 0 {
+					return relayResult{direction: direction, bytes: total, duration: time.Since(started), err: io.ErrShortWrite}
+				}
 			}
 			
 			// Only push the dead man's switch forward periodically
@@ -678,8 +732,7 @@ func copyStreaming(dst io.Writer, src io.Reader, rawDst net.Conn, rawSrc net.Con
 			}
 		}
 		if rerr != nil {
-			// Returns on real EOF, network reset, or idle timeout
-			return
+			return relayResult{direction: direction, bytes: total, duration: time.Since(started), err: rerr}
 		}
 	}
 }
