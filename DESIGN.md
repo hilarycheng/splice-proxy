@@ -171,3 +171,26 @@ A targeted fix will be designed once a real stall is captured with this telemetr
 
 ### Expected Result
 Improves Gemini Web stability during long prompts and reduces JetBrains AI/plugin `Premature EOF` errors caused by hidden relay failures.
+
+## Changes: [2026-04-27] JetBrains / Codex GitHub Download Stability Patch
+
+### Fixed
+* **Silent Tunnel Body Corruption:** Replaced unchecked `dst.Write(...)` calls in the CONNECT relay path with full-write handling. Partial writes and write errors are now detected instead of silently dropping bytes mid-stream.
+* **JetBrains Codex Install Timeout:** Fixed a failure mode where GitHub downloads could start successfully, return `HTTP 200 OK`, transfer for a while, then stall until JetBrains reported `read timed out`.
+* **Premature Idle Lane Termination:** Changed tunnel timeout behavior from per-direction idle timeout to shared tunnel activity tracking, so an idle upload lane no longer kills an active download lane.
+* **CONNECT Download EOF Handling:** Improved tunnel shutdown behavior for large HTTPS downloads so the remote-to-client completion path is handled cleanly instead of waiting indefinitely on the opposite idle direction.
+* **Hidden Relay Failures:** Relay errors are now surfaced through structured logs with direction, byte count, duration, and close reason.
+
+### Changed
+* **Tunnel Idle Timeout:** Increased long-lived CONNECT tunnel tolerance from short per-lane deadlines to a shared **30-minute tunnel idle timeout**, suitable for GitHub release downloads, JetBrains plugin installs, AI assistant context upgrades, and slow VPN/WireGuard paths.
+* **Relay Coordination:** CONNECT tunnel relay now treats download-side completion/error as a stronger close signal, while still allowing browser-to-remote idle periods during active streaming.
+* **Write Path Semantics:** Relay writes now guarantee the full buffer is written or return an explicit error. This prevents TLS streams from silently losing body bytes.
+
+### Purpose
+JetBrains AI Assistant / Codex context upgrades download assets from GitHub through the HTTP proxy. The observed failure was:
+
+```text
+failed to install codex
+response: 200 OK
+cause: read timed out
+```
