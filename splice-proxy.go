@@ -26,6 +26,8 @@ import (
 	"os/signal"
 	"reflect"
 	"runtime"
+	"runtime/pprof"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -578,6 +580,106 @@ func nextReqID() uint32 {
 // Used by diagLoop for observability; zero behavior impact.
 var activeRelays atomic.Int64
 
+// debugConsoleEnabled gates all foreground-only diagnostics. Normal/systemd
+// startup leaves this false, so there is no stdin menu, routine registry table,
+// or frequent ping loop unless --debug-console is explicitly passed.
+var debugConsoleEnabled atomic.Bool
+
+type trackedRoutine struct {
+	id    uint64
+	name  string
+	reqID uint32
+	host  atomic.Value // string
+	state atomic.Value // string
+	start time.Time
+	last  atomic.Int64 // UnixNano
+	bytes atomic.Int64
+}
+
+var routineTracker = struct {
+	next atomic.Uint64
+	mu   sync.Mutex
+	m    map[uint64]*trackedRoutine
+}{m: make(map[uint64]*trackedRoutine)}
+
+func registerRoutine(name string, reqID uint32, host string) (*trackedRoutine, func()) {
+	if !debugConsoleEnabled.Load() {
+		return nil, func() {}
+	}
+	now := time.Now()
+	tr := &trackedRoutine{id: routineTracker.next.Add(1), name: name, reqID: reqID, start: now}
+	tr.host.Store(host)
+	tr.state.Store("start")
+	tr.last.Store(now.UnixNano())
+	routineTracker.mu.Lock()
+	routineTracker.m[tr.id] = tr
+	routineTracker.mu.Unlock()
+	return tr, func() {
+		routineTracker.mu.Lock()
+		delete(routineTracker.m, tr.id)
+		routineTracker.mu.Unlock()
+	}
+}
+
+func goTracked(name string, reqID uint32, host string, fn func(*trackedRoutine)) {
+	if !debugConsoleEnabled.Load() {
+		go fn(nil)
+		return
+	}
+	go func() {
+		tr, done := registerRoutine(name, reqID, host)
+		defer done()
+		fn(tr)
+	}()
+}
+
+func (tr *trackedRoutine) setHost(host string) {
+	if tr != nil {
+		tr.host.Store(host)
+	}
+}
+
+func (tr *trackedRoutine) setState(state string) {
+	if tr != nil {
+		tr.state.Store(state)
+		tr.last.Store(time.Now().UnixNano())
+	}
+}
+
+func (tr *trackedRoutine) addBytes(n int) {
+	if tr != nil && n > 0 {
+		tr.bytes.Add(int64(n))
+		tr.last.Store(time.Now().UnixNano())
+	}
+}
+
+type routineSnapshot struct {
+	ID    uint64
+	Name  string
+	ReqID uint32
+	Host  string
+	State string
+	Start time.Time
+	Last  time.Time
+	Bytes int64
+}
+
+func snapshotRoutines() []routineSnapshot {
+	routineTracker.mu.Lock()
+	defer routineTracker.mu.Unlock()
+	out := make([]routineSnapshot, 0, len(routineTracker.m))
+	for _, tr := range routineTracker.m {
+		host, _ := tr.host.Load().(string)
+		state, _ := tr.state.Load().(string)
+		out = append(out, routineSnapshot{
+			ID: tr.id, Name: tr.name, ReqID: tr.reqID, Host: host, State: state,
+			Start: tr.start, Last: time.Unix(0, tr.last.Load()), Bytes: tr.bytes.Load(),
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Start.Before(out[j].Start) })
+	return out
+}
+
 // ─── Copy buffer pool ────────────────────────────────────────────────────────
 
 var copyBufPool = sync.Pool{
@@ -604,149 +706,106 @@ func closeWrite(c net.Conn) {
 
 // ─── Tunnel relay (bidirectional copy) ───────────────────────────────────────
 //
-// CONNECT tunnels need two behaviours at the same time:
-//
-//   - For LLM/SSE-style streams, do not treat an idle upload side as proof that
-//     the download side is dead. Browsers can stop sending for a long time while
-//     the server is still streaming.
-//   - For large downloads, never ignore short writes or write errors. Losing one
-//     TLS record byte can make the client wait until its own read timeout even
-//     though the HTTP response was already "200 OK".
-//
-// This relay therefore uses a shared idle timer for the whole tunnel, checks all
-// write results, and only aborts the tunnel on real EOF/error or whole-tunnel
-// inactivity.
-type laneResult struct {
-	direction string
-	bytes     int64
-	err       error
-}
-
-const (
-	tunnelIdleTimeout = 30 * time.Minute
-	readPollInterval  = 1 * time.Minute
-)
-
+// SSE-safe: uses a small copy buffer (4 KB) so that tiny streaming chunks are
+// forwarded immediately instead of being batched into a 32 KB flush. Does NOT
+// half-close on one-direction completion — some servers (notably Google SSE
+// endpoints) treat the client's half-close as an end-of-stream signal and will
+// tear down the response. Instead we let both goroutines finish naturally and
+// close everything at the end.
 func relay(id uint32, label, host string, client net.Conn, clientReader io.Reader, remote net.Conn) {
+	tr, done := registerRoutine("relay", id, host)
+	defer done()
+	if tr != nil {
+		tr.setState("open")
+	}
+
 	activeRelays.Add(1)
 	defer activeRelays.Add(-1)
 
 	logf("REQ-%05d | TUNNEL | open %s %s", id, label, host)
 
-	// UnixNano timestamp of the last successful byte movement in either direction.
-	var lastActivity atomic.Int64
-	lastActivity.Store(time.Now().UnixNano())
+	var wg sync.WaitGroup
+	wg.Add(2)
 
-	results := make(chan laneResult, 2)
+	// Lane 1: Browser -> Remote (Upload)
+	// If the browser half-closes, this lane finishes quietly without destroying the socket.
+	goTracked("relay-upload", id, host, func(lane *trackedRoutine) {
+		defer wg.Done()
+		copyStreaming(remote, clientReader, remote, client, id, label, host, "From Browser", lane)
+		closeWrite(remote)
+	})
 
-	// Lane 1: Client -> Remote (upload / TLS requests).
-	go func() {
-		n, err := copyStreaming(remote, clientReader, remote, client, &lastActivity, "upload")
-		if err == nil || errors.Is(err, io.EOF) {
-			// A true client EOF means no more request bytes are coming. Half-close the
-			// remote write side but keep reading the response.
-			closeWrite(remote)
-		}
-		results <- laneResult{direction: "upload", bytes: n, err: err}
-	}()
+	// Lane 2: Remote -> Browser (Download)
+	goTracked("relay-download", id, host, func(lane *trackedRoutine) {
+		defer wg.Done()
+		copyStreaming(client, remote, client, remote, id, label, host, "From Remote", lane)
+		closeWrite(client)
+	})
 
-	// Lane 2: Remote -> Client (download / TLS responses).
-	go func() {
-		n, err := copyStreaming(client, remote, client, remote, &lastActivity, "download")
-		if err == nil || errors.Is(err, io.EOF) {
-			// Remote finished the response stream. Tell the client cleanly.
-			closeWrite(client)
-		}
-		results <- laneResult{direction: "download", bytes: n, err: err}
-	}()
-
-	for completed := 0; completed < 2; completed++ {
-		res := <-results
-		logf("REQ-%05d | TUNNEL | lane done %s %s %s bytes=%d err=%v",
-			id, label, host, res.direction, res.bytes, res.err)
-
-		normal := res.err == nil || errors.Is(res.err, io.EOF)
-
-		if res.direction == "upload" && normal {
-			// Do not close the whole tunnel just because the client request side ended.
-			// The response body may still be downloading.
-			continue
-		}
-
-		// If the download side ended, the client has all bytes it can get. If either
-		// side ended with an error/idle timeout, tear down both sockets to unblock the
-		// sibling goroutine and avoid leaked tunnels.
-		break
+	// Wait gracefully for BOTH directions to naturally conclude or hit the timeout.
+	if tr != nil {
+		tr.setState("wait lanes")
 	}
+	wg.Wait()
 
+	// Safe, synchronized teardown
 	_ = client.Close()
 	_ = remote.Close()
 
 	logf("REQ-%05d | TUNNEL | closed %s %s", id, label, host)
 }
 
-// copyStreaming copies bytes with small buffers for low-latency streaming while
-// still being safe for large downloads. It returns only after EOF, real error, or
-// whole-tunnel idle timeout.
-func copyStreaming(dst io.Writer, src io.Reader, rawDst net.Conn, rawSrc net.Conn, lastActivity *atomic.Int64, direction string) (int64, error) {
-	buf := make([]byte, 16*1024)
-	var total int64
+func writeFull(dst io.Writer, p []byte) error {
+	for len(p) > 0 {
+		n, err := dst.Write(p)
+		if n > 0 {
+			p = p[n:]
+		}
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+	}
+	return nil
+}
 
+// copyStreaming implements a sliding idle timeout.
+// Every successful read/write updates the debug routine last-activity time.
+func copyStreaming(dst io.Writer, src io.Reader, rawDst net.Conn, rawSrc net.Conn, id uint32, label, host string, direction string, tr *trackedRoutine) {
+	buf := make([]byte, 4096)
+	timeout := 3 * time.Minute
 	for {
-		// Use a short read poll so an idle upload lane can notice that the download
-		// lane is still active instead of killing the tunnel prematurely.
-		_ = rawSrc.SetReadDeadline(time.Now().Add(readPollInterval))
+		// Reset dead man's switch
+		_ = rawSrc.SetReadDeadline(time.Now().Add(timeout))
+		_ = rawDst.SetWriteDeadline(time.Now().Add(timeout))
+		if tr != nil {
+			tr.setState("read " + direction)
+		}
 
 		nr, rerr := src.Read(buf)
 		if nr > 0 {
-			_ = rawDst.SetWriteDeadline(time.Now().Add(tunnelIdleTimeout))
-			nw, werr := writeAll(dst, buf[:nr])
-			total += int64(nw)
-			if nw > 0 {
-				lastActivity.Store(time.Now().UnixNano())
+			if tr != nil {
+				tr.setState("write " + direction)
 			}
-			if werr != nil {
-				return total, fmt.Errorf("%s write: %w", direction, werr)
-			}
-			if nw != nr {
-				return total, fmt.Errorf("%s write: short write %d/%d", direction, nw, nr)
-			}
-		}
-
-		if rerr != nil {
-			if isTimeoutErr(rerr) {
-				last := time.Unix(0, lastActivity.Load())
-				if time.Since(last) < tunnelIdleTimeout {
-					// Only this lane is idle; the opposite lane may still be transferring.
-					continue
+			if err := writeFull(dst, buf[:nr]); err != nil {
+				if tr != nil {
+					tr.setState("write error: " + err.Error())
 				}
-				return total, fmt.Errorf("%s idle timeout after %v", direction, tunnelIdleTimeout)
+				return
 			}
-			return total, rerr
+			if tr != nil {
+				tr.addBytes(nr)
+			}
+		}
+		if rerr != nil {
+			if tr != nil {
+				tr.setState("done: " + rerr.Error())
+			}
+			return
 		}
 	}
-}
-
-func writeAll(dst io.Writer, p []byte) (int, error) {
-	written := 0
-	for written < len(p) {
-		n, err := dst.Write(p[written:])
-		if n > 0 {
-			written += n
-		}
-		if err != nil {
-			return written, err
-		}
-		if n == 0 {
-			return written, io.ErrShortWrite
-		}
-	}
-	return written, nil
-}
-
-func isTimeoutErr(err error) bool {
-	var ne net.Error
-	return errors.As(err, &ne) && ne.Timeout()
 }
 
 // tuneTCP configures TCP connections for low-latency streaming and Keep-Alives.
@@ -1072,7 +1131,7 @@ func serveHTTP(ln net.Listener, r *Resolver) {
 			time.Sleep(50 * time.Millisecond)
 			continue
 		}
-		go handleHTTP(r, c)
+		goTracked("http-handler", 0, c.RemoteAddr().String(), func(tr *trackedRoutine) { handleHTTP(r, c) })
 	}
 }
 
@@ -1087,7 +1146,7 @@ func serveSOCKS5(ln net.Listener, r *Resolver) {
 			time.Sleep(50 * time.Millisecond)
 			continue
 		}
-		go handleSOCKS5(r, c)
+		goTracked("socks5-handler", 0, c.RemoteAddr().String(), func(tr *trackedRoutine) { handleSOCKS5(r, c) })
 	}
 }
 
@@ -1233,17 +1292,247 @@ func tunnelHealthLoop(tnet *netstack.Net) {
 	}
 }
 
+// ─── Debug console and ICMP ping (opt-in) ────────────────────────────────────
+
+var debugPingSeq atomic.Uint32
+
+type debugPingResult struct {
+	Target string
+	Seq    uint16
+	Bytes  int
+	RTT    time.Duration
+	TTL    int // -1 means unavailable from gVisor ping4 endpoint
+}
+
+func (r debugPingResult) StandardLine() string {
+	ttl := ""
+	if r.TTL >= 0 {
+		ttl = fmt.Sprintf(" ttl=%d", r.TTL)
+	}
+	return fmt.Sprintf("%d bytes from %s: icmp_seq=%d%s time=%v",
+		r.Bytes, r.Target, r.Seq, ttl, r.RTT.Truncate(time.Millisecond))
+}
+
+func icmpChecksum(b []byte) uint16 {
+	var sum uint32
+	for len(b) >= 2 {
+		sum += uint32(binary.BigEndian.Uint16(b[:2]))
+		b = b[2:]
+	}
+	if len(b) == 1 {
+		sum += uint32(b[0]) << 8
+	}
+	for (sum >> 16) != 0 {
+		sum = (sum & 0xffff) + (sum >> 16)
+	}
+	return ^uint16(sum)
+}
+
+func buildICMPEchoRequest(id, seq uint16, payload []byte) []byte {
+	pkt := make([]byte, 8+len(payload))
+	pkt[0] = 8 // ICMPv4 Echo Request
+	pkt[1] = 0 // code
+	binary.BigEndian.PutUint16(pkt[4:6], id)
+	binary.BigEndian.PutUint16(pkt[6:8], seq)
+	copy(pkt[8:], payload)
+	binary.BigEndian.PutUint16(pkt[2:4], icmpChecksum(pkt))
+	return pkt
+}
+
+func parseICMPEchoReply(pkt []byte) (id, seq uint16, payload []byte, err error) {
+	if len(pkt) < 8 {
+		return 0, 0, nil, fmt.Errorf("short icmp reply: %d bytes", len(pkt))
+	}
+	if pkt[0] != 0 || pkt[1] != 0 {
+		return 0, 0, nil, fmt.Errorf("unexpected icmp type=%d code=%d", pkt[0], pkt[1])
+	}
+	return binary.BigEndian.Uint16(pkt[4:6]), binary.BigEndian.Uint16(pkt[6:8]), pkt[8:], nil
+}
+
+// debugPingOnce sends one lightweight ICMP Echo Request through the embedded
+// gVisor/WireGuard netstack. The ping4 endpoint expects a full ICMP packet,
+// not an arbitrary payload.
+func debugPingOnce(tnet *netstack.Net, target string, timeout time.Duration) (debugPingResult, error) {
+	var zero debugPingResult
+	c, err := tnet.Dial("ping4", target)
+	if err != nil {
+		return zero, err
+	}
+	defer c.Close()
+
+	seq := uint16(debugPingSeq.Add(1))
+	id := uint16(os.Getpid())
+	payload := []byte(fmt.Sprintf("splice-proxy-%d", time.Now().UnixNano()))
+	request := buildICMPEchoRequest(id, seq, payload)
+
+	_ = c.SetReadDeadline(time.Now().Add(timeout))
+	start := time.Now()
+	if _, err := c.Write(request); err != nil {
+		return zero, err
+	}
+
+	reply := make([]byte, 1500)
+	n, err := c.Read(reply)
+	if err != nil {
+		return zero, err
+	}
+	rtt := time.Since(start)
+	replyID, replySeq, replyPayload, err := parseICMPEchoReply(reply[:n])
+	if err != nil {
+		return zero, err
+	}
+	// gVisor's ping endpoint may own/rewrite the ICMP identifier internally,
+	// so do not treat an identifier mismatch as failure. The sequence number plus
+	// our unique timestamp payload is enough to prove this reply belongs to this
+	// probe.
+	if replySeq != seq || !bytes.Equal(replyPayload, payload) {
+		return zero, fmt.Errorf("unexpected icmp reply id=%d seq=%d len=%d expected_seq=%d expected_len=%d",
+			replyID, replySeq, len(replyPayload), seq, len(payload))
+	}
+	return debugPingResult{Target: target, Seq: replySeq, Bytes: len(replyPayload), RTT: rtt, TTL: -1}, nil
+}
+
+func debugPingLoop(tnet *netstack.Net) {
+	const (
+		interval = 5 * time.Second
+		target   = "1.1.1.1"
+		timeout  = 2 * time.Second
+	)
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	failStreak := 0
+	for range t.C {
+		res, err := debugPingOnce(tnet, target, timeout)
+		if err != nil {
+			failStreak++
+			logf("SYS | PING  | Request timeout for icmp_seq=%d target=%s streak=%d err=%v", debugPingSeq.Load(), target, failStreak, err)
+			continue
+		}
+		if failStreak > 0 {
+			logf("SYS | PING  | %s recovered_after=%d", res.StandardLine(), failStreak)
+		} else {
+			logf("SYS | PING  | %s", res.StandardLine())
+		}
+		failStreak = 0
+	}
+}
+
+func printSummary(dev *device.Device, resolver *Resolver) {
+	s := readWGStats(dev)
+	hsAge := "never"
+	if s.lastHandshakeUnix != 0 {
+		hsAge = time.Since(time.Unix(s.lastHandshakeUnix, 0)).Truncate(time.Second).String()
+	}
+	fmt.Printf("goroutines=%d relays=%d tracked=%d dns_cache=%d wg_hs_age=%s wg_rx=%d wg_tx=%d\n",
+		runtime.NumGoroutine(), activeRelays.Load(), len(snapshotRoutines()), resolver.cache.size(), hsAge, s.rxBytes, s.txBytes)
+}
+
+func printRoutines() {
+	now := time.Now()
+	items := snapshotRoutines()
+	fmt.Printf("%-4s %-19s %-9s %-9s %-16s %-9s %-12s %-24s %s\n", "ID", "START", "AGE", "IDLE", "TYPE", "REQ", "BYTES", "STATE", "HOST")
+	for _, it := range items {
+		req := "-"
+		if it.ReqID != 0 {
+			req = fmt.Sprintf("REQ-%05d", it.ReqID)
+		}
+		fmt.Printf("%-4d %-19s %-9s %-9s %-16s %-9s %-12d %-24s %s\n",
+			it.ID,
+			it.Start.Format("2006-01-02 15:04:05"),
+			now.Sub(it.Start).Truncate(time.Second),
+			now.Sub(it.Last).Truncate(time.Second),
+			it.Name,
+			req,
+			it.Bytes,
+			it.State,
+			it.Host,
+		)
+	}
+}
+
+func writeGoroutineDump() error {
+	name := "goroutines-" + time.Now().Format("20060102-150405") + ".txt"
+	f, err := os.Create(name)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if _, err := fmt.Fprintf(f, "splice-proxy goroutine dump at %s\n\n", time.Now().Format(time.RFC3339)); err != nil {
+		return err
+	}
+	if err := pprof.Lookup("goroutine").WriteTo(f, 2); err != nil {
+		return err
+	}
+	fmt.Printf("wrote %s\n", name)
+	return nil
+}
+
+func debugConsoleLoop(tnet *netstack.Net, dev *device.Device, resolver *Resolver) {
+	fmt.Println("\nDebug console enabled. Commands: h=help, s=summary, r=routines, d=dump goroutines, p=ping now, q=exit now")
+	sc := bufio.NewScanner(os.Stdin)
+	for {
+		fmt.Print("splice-proxy> ")
+		if !sc.Scan() {
+			return
+		}
+		cmd := strings.ToLower(strings.TrimSpace(sc.Text()))
+		switch cmd {
+		case "", "h", "help", "?":
+			fmt.Println("Commands: s=summary, r=routines with START/AGE/IDLE, d=write full goroutine dump, p=ICMP ping now, q=exit now")
+		case "s", "summary":
+			printSummary(dev, resolver)
+		case "r", "routines":
+			printRoutines()
+		case "d", "dump":
+			if err := writeGoroutineDump(); err != nil {
+				fmt.Printf("dump failed: %v\n", err)
+			}
+		case "p", "ping":
+			res, err := debugPingOnce(tnet, "1.1.1.1", 2*time.Second)
+			if err != nil {
+				fmt.Printf("Request timeout for icmp_seq=%d target=1.1.1.1 err=%v\n", debugPingSeq.Load(), err)
+			} else {
+				fmt.Println(res.StandardLine())
+			}
+		case "q", "quit", "exit":
+			logf("SYS | STOP  | debug console requested exit")
+			os.Exit(0)
+		default:
+			fmt.Printf("unknown command %q; type h for help\n", cmd)
+		}
+	}
+}
+
+func parseArgs(args []string) bool {
+	debugConsole := false
+	for _, arg := range args {
+		switch arg {
+		case "--debug-console", "--console", "-debug-console":
+			debugConsole = true
+		case "--help", "-h":
+			fmt.Println("usage: splice-proxy [--debug-console]")
+			os.Exit(0)
+		default:
+			if strings.HasPrefix(arg, "-") {
+				logf("SYS | WARN  | unknown option ignored: %s", arg)
+			} else {
+				logf("SYS | WARN  | positional config path ignored, using default config.ini: %s", arg)
+			}
+		}
+	}
+	return debugConsole
+}
+
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 func main() {
 	cfgPath := "config.ini"
-	if len(os.Args) > 1 {
-		cfgPath = os.Args[1]
-	}
+	debugConsole := parseArgs(os.Args[1:])
+	debugConsoleEnabled.Store(debugConsole)
 
 	cfg, err := loadConfig(cfgPath)
 	if err != nil {
-		logf("SYS | FATAL | config: %v", err)
+		logf("SYS | FATAL | config %s: %v", cfgPath, err)
 		os.Exit(1)
 	}
 
@@ -1254,6 +1543,9 @@ func main() {
 	logf("SYS | INFO  | wg peer: %s", cfg.WGPeerEndpoint)
 	logf("SYS | INFO  | wg ip  : %v", cfg.WGLocalIPs)
 	logf("SYS | INFO  | dns    : %v (cache=%v)", cfg.DNSServers, cfg.DNSCacheTTL)
+	if debugConsole {
+		logf("SYS | INFO  | debug console enabled: stdin menu + tracked routine start times + 5s ICMP ping")
+	}
 	if len(cfg.HostOverrides) > 0 {
 		logf("SYS | INFO  | hosts  : %d override(s) loaded", len(cfg.HostOverrides))
 		for host, ip := range cfg.HostOverrides {
@@ -1284,10 +1576,14 @@ func main() {
 		os.Exit(1)
 	}
 
-	go serveHTTP(httpLn, resolver)
-	go serveSOCKS5(socksLn, resolver)
-	go diagLoop(dev, resolver)
-	go tunnelHealthLoop(tnet)
+	goTracked("http-accept", 0, cfg.HTTPListen, func(tr *trackedRoutine) { serveHTTP(httpLn, resolver) })
+	goTracked("socks5-accept", 0, cfg.SOCKS5Listen, func(tr *trackedRoutine) { serveSOCKS5(socksLn, resolver) })
+	goTracked("diag-loop", 0, "", func(tr *trackedRoutine) { diagLoop(dev, resolver) })
+	goTracked("tcp-health-loop", 0, "1.1.1.1:443", func(tr *trackedRoutine) { tunnelHealthLoop(tnet) })
+	if debugConsole {
+		goTracked("debug-ping-loop", 0, "1.1.1.1", func(tr *trackedRoutine) { debugPingLoop(tnet) })
+		goTracked("debug-console", 0, "stdin", func(tr *trackedRoutine) { debugConsoleLoop(tnet, dev, resolver) })
+	}
 
 	logf("SYS | READY | proxies listening")
 

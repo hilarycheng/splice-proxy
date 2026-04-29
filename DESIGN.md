@@ -194,3 +194,33 @@ failed to install codex
 response: 200 OK
 cause: read timed out
 ```
+
+## Changes: [2026-04-29] Debug Console & ICMP Tunnel Probe Diagnostics
+
+### Added
+
+* **Opt-in Debug Console Mode:** Added `--debug-console` startup flag for foreground diagnostics. Normal startup still reads `config.ini` by default and remains suitable for background/systemd/service usage.
+* **Interactive Runtime Menu:** Added console commands for live inspection:
+  * `h` Îíñow help
+  * `s` Îíñint runtime summary
+  * `r` Îíñint tracked routine table
+  * `d` Îíñite full goroutine stack dump to a timestamped file
+  * `p` Îíñn ICMP ping probe immediately
+  * `q` Îíñit the process
+* **Tracked Routine Registry:** Added tracking for proxy-owned goroutines with:
+  * routine ID
+  * start time
+  * age
+  * idle duration
+  * routine type
+  * request ID
+  * host
+  * state
+  * byte count
+* **Start-Time Diagnostics:** Routine table now shows exact `START` timestamp so long-lived goroutines can be correlated with request logs and DIAG lines.
+* **ICMP Ping Probe Through gVisor/WireGuard:** Added lightweight ICMPv4 Echo probing through the embedded netstack using the `ping4` path.
+* **Frequent Debug Ping Loop:** When `--debug-console` is enabled, the proxy emits periodic ping-style tunnel liveness output.
+* **Manual Ping Command:** Added `p` console command to run an immediate ping probe.
+* **Ping-Style Output:** ICMP output now resembles standard ping:
+  ```text
+  32 bytes from 1.1.1.1: icmp_seq=12 time=168ms
