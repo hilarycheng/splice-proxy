@@ -224,3 +224,51 @@ cause: read timed out
 * **Ping-Style Output:** ICMP output now resembles standard ping:
   ```text
   32 bytes from 1.1.1.1: icmp_seq=12 time=168ms
+
+## Changes: [2026-05-06] SOCKS5 Gmail PR_END_OF_FILE_ERROR Fix v3
+
+### Fixed
+
+* **SOCKS5 IPv6 Target Formatting Bug**
+  * Fixed the SOCKS5 `ATYP=0x04` path so IPv6 hosts are kept unbracketed internally.
+  * The old code pre-bracketed IPv6 and then called `net.JoinHostPort()`, producing invalid targets like `[[2607:f8b0:...]]:443`.
+  * This can break Firefox when browser-side/local DNS returns an IPv6 address for `gmail.google.com`.
+
+* **SOCKS5 Direct-IP Address Family Guard**
+  * Added WireGuard address-family validation for literal IP SOCKS5 targets.
+  * If the configured WireGuard tunnel is IPv4-only and Firefox sends a literal IPv6 target, the proxy now fails fast with a clear log instead of trying an unusable route.
+  * Log message explicitly suggests enabling Firefox **Proxy DNS when using SOCKS v5** or configuring IPv6 in WireGuard.
+
+* **SOCKS5 Reply Write Safety**
+  * Added `writeSOCKS5Reply()` and changed SOCKS5 replies to use full-write semantics.
+  * This aligns SOCKS5 control replies with the existing tunnel `writeFull()` behavior.
+
+* **SOCKS5 Handshake Deadline Cleanup**
+  * Clears the temporary 15-second SOCKS handshake read deadline immediately after the full SOCKS request is read and before the outbound WireGuard/netstack dial.
+  * This avoids carrying an expired client read deadline into the TLS relay after a slow outbound dial.
+
+### Why This Matters
+
+The browser is using SOCKS5 only, so HTTP CONNECT changes do not explain the Gmail failure. The risky path is:
+
+```text
+Firefox SOCKS5 -> handleSOCKS5() -> DialHostPort() -> gVisor/WireGuard TCP -> gmail.google.com:443
+```
+
+For Gmail, Firefox may send either:
+
+* `ATYP=0x03` domain target: `gmail.google.com` — best case; proxy does DNS through WireGuard.
+* `ATYP=0x01` IPv4 target — acceptable if browser resolved locally.
+* `ATYP=0x04` IPv6 target — previously buggy due to double brackets, and still unusable if the WG tunnel is IPv4-only.
+
+This patch fixes the IPv6 formatting bug and makes IPv4-only tunnel behavior explicit.
+
+### Important Browser Setting
+
+For the most reliable behavior with this proxy, Firefox should enable:
+
+```text
+Proxy DNS when using SOCKS v5
+```
+
+Without that setting, Firefox may resolve Gmail locally and send a literal IPv6 address to the SOCKS5 proxy. If the WireGuard tunnel is IPv4-only, the proxy cannot recover the original domain name from that SOCKS5 request.

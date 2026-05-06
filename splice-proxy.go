@@ -428,6 +428,14 @@ type Resolver struct {
 	cache   *dnsCache
 	nextSrv atomic.Uint32
 
+	// Address-family mode comes from configured WG local IPs.
+	// If the tunnel has only IPv4 local addresses, avoid using IPv6 DNS answers
+	// for large Google sites. Some WG/netstack setups can appear to connect to an
+	// IPv6 address and then fail during TLS, which Firefox reports as
+	// PR_END_OF_FILE_ERROR.
+	allowIPv4 bool
+	allowIPv6 bool
+
 	// Host overrides: exact match takes priority over wildcard.
 	// Wildcards are stored as "suffix" (e.g. ".example.com") and matched longest-first.
 	exactHosts    map[string]string // "gemini.google.com" -> "142.250.80.110"
@@ -439,11 +447,14 @@ type wildcardEntry struct {
 	ip     string // "1.2.3.4"
 }
 
-func newResolver(tnet *netstack.Net, servers []string, ttl time.Duration, overrides map[string]string) *Resolver {
+func newResolver(tnet *netstack.Net, servers []string, ttl time.Duration, overrides map[string]string, localIPs []netip.Addr) *Resolver {
+	allowIPv4, allowIPv6 := addressFamilyMode(localIPs)
 	r := &Resolver{
 		tnet:       tnet,
 		servers:    servers,
 		cache:      newDNSCache(ttl),
+		allowIPv4:  allowIPv4,
+		allowIPv6:  allowIPv6,
 		exactHosts: make(map[string]string),
 	}
 	for host, ip := range overrides {
@@ -470,6 +481,76 @@ func sortWildcardsLongestFirst(ws []wildcardEntry) {
 			ws[j], ws[j-1] = ws[j-1], ws[j]
 		}
 	}
+}
+
+func addressFamilyMode(localIPs []netip.Addr) (allowIPv4, allowIPv6 bool) {
+	for _, ip := range localIPs {
+		if ip.Is4() || ip.Is4In6() {
+			allowIPv4 = true
+			continue
+		}
+		if ip.Is6() {
+			allowIPv6 = true
+		}
+	}
+	// Be conservative if config parsing ever passes an empty slice here.
+	if !allowIPv4 && !allowIPv6 {
+		allowIPv4 = true
+	}
+	return allowIPv4, allowIPv6
+}
+
+// orderResolvedAddrs keeps DNS answers compatible with the tunnel address
+// family. Prefer IPv4 whenever available because many splice-proxy deployments
+// are IPv4-only WG tunnels with allowed_ips=0.0.0.0/0.
+func (r *Resolver) orderResolvedAddrs(addrs []string) []string {
+	var v4, v6, unknown []string
+	for _, addr := range addrs {
+		ip := net.ParseIP(addr)
+		if ip == nil {
+			unknown = append(unknown, addr)
+			continue
+		}
+		if ip.To4() != nil {
+			if r.allowIPv4 {
+				v4 = append(v4, addr)
+			}
+			continue
+		}
+		if r.allowIPv6 {
+			v6 = append(v6, addr)
+		}
+	}
+
+	out := make([]string, 0, len(v4)+len(v6)+len(unknown))
+	// IPv4-first is intentional for Google/Gmail compatibility through
+	// IPv4-only WireGuard peers. IPv6 is still used when the tunnel is IPv6-only
+	// or after IPv4 addresses fail.
+	if r.allowIPv4 {
+		out = append(out, v4...)
+	}
+	if r.allowIPv6 {
+		out = append(out, v6...)
+	}
+	out = append(out, unknown...)
+	if len(out) == 0 {
+		return addrs
+	}
+	return out
+}
+
+func (r *Resolver) ipAllowedByTunnel(ip net.IP) bool {
+	if ip == nil {
+		return true
+	}
+	if ip.To4() != nil {
+		return r.allowIPv4
+	}
+	return r.allowIPv6
+}
+
+func (r *Resolver) explainIPMode() string {
+	return fmt.Sprintf("wireguard address family: ipv4=%v ipv6=%v", r.allowIPv4, r.allowIPv6)
 }
 
 // matchOverride returns the overridden IP for host, or "" if no match.
@@ -509,9 +590,15 @@ func (r *Resolver) resolverForGo() *net.Resolver {
 
 // Resolve returns at least one IP for host, using cache when possible.
 func (r *Resolver) Resolve(ctx context.Context, host string) ([]string, error) {
-	// If already an IP, pass through
-	if ip := net.ParseIP(host); ip != nil {
-		return []string{host}, nil
+	// If already an IP, pass through only when the configured WireGuard
+	// address family can actually route it. This matters for Firefox SOCKS5
+	// when "Proxy DNS when using SOCKS v5" is disabled: Firefox may send a
+	// literal IPv6 address for gmail.google.com even though the tunnel is IPv4-only.
+	if ip := net.ParseIP(strings.Trim(host, "[]")); ip != nil {
+		if !r.ipAllowedByTunnel(ip) {
+			return nil, fmt.Errorf("direct IP target %s is not usable with %s; enable Firefox 'Proxy DNS when using SOCKS v5' or configure IPv6 in WireGuard", host, r.explainIPMode())
+		}
+		return []string{strings.Trim(host, "[]")}, nil
 	}
 
 	// Host override takes priority over cache and DNS
@@ -533,6 +620,7 @@ func (r *Resolver) Resolve(ctx context.Context, host string) ([]string, error) {
 	if len(addrs) == 0 {
 		return nil, fmt.Errorf("no addresses for %s", host)
 	}
+	addrs = r.orderResolvedAddrs(addrs)
 	r.cache.put(host, addrs)
 	return addrs, nil
 }
@@ -543,16 +631,22 @@ func (r *Resolver) DialHostPort(ctx context.Context, hostport string) (net.Conn,
 	if err != nil {
 		return nil, err
 	}
+	// net.SplitHostPort normally removes IPv6 brackets, but be defensive because
+	// older SOCKS5 code accidentally passed pre-bracketed IPv6 strings.
+	host = strings.Trim(host, "[]")
 	ips, err := r.Resolve(ctx, host)
 	if err != nil {
 		return nil, fmt.Errorf("resolve %s: %w", host, err)
 	}
 
-	// Happy-eyeballs-lite: try each IP in order, 3s timeout each
+	// Happy-eyeballs-lite: try each IP in order. The order is already filtered
+	// by orderResolvedAddrs(), normally IPv4-first for IPv4 WG tunnels.
 	var lastErr error
+	attempted := make([]string, 0, len(ips))
 	for _, ip := range ips {
 		addr := net.JoinHostPort(ip, port)
-		dctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		attempted = append(attempted, addr)
+		dctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		c, err := r.tnet.DialContext(dctx, "tcp", addr)
 		cancel()
 		if err == nil {
@@ -560,7 +654,7 @@ func (r *Resolver) DialHostPort(ctx context.Context, hostport string) (net.Conn,
 		}
 		lastErr = err
 	}
-	return nil, fmt.Errorf("dial %s: %w", hostport, lastErr)
+	return nil, fmt.Errorf("dial %s via %v: %w", hostport, attempted, lastErr)
 }
 
 // ─── Request ID counter ──────────────────────────────────────────────────────
@@ -696,22 +790,64 @@ func copyBuffered(dst io.Writer, src io.Reader) (int64, error) {
 	return n, err
 }
 
-// closeWrite safely attempts a TCP Half-Close.
-// It signals that we are done sending data, but keeps the receive channel open.
-func closeWrite(c net.Conn) {
-	if cw, ok := c.(interface{ CloseWrite() error }); ok {
-		_ = cw.CloseWrite()
-	}
+// ─── Tunnel relay (bidirectional copy) ───────────────────────────────────────
+
+const (
+	// CONNECT tunnels are long-lived HTTPS/TLS pipes. Gmail/Google/AI sites can
+	// keep one direction idle for a long time while the opposite direction remains
+	// active, so the timeout must be shared by the whole tunnel, not enforced per
+	// copy lane.
+	tunnelIdleTimeout = 30 * time.Minute
+
+	// Watchdog check interval. Relay goroutines block in Read() naturally; the
+	// watchdog closes both sockets if the whole tunnel is idle too long.
+	relayWatchdogInterval = 5 * time.Second
+)
+
+type relayActivity struct {
+	last atomic.Int64 // UnixNano of last successful read/write in either lane
 }
 
-// ─── Tunnel relay (bidirectional copy) ───────────────────────────────────────
+func newRelayActivity() *relayActivity {
+	a := &relayActivity{}
+	a.touch()
+	return a
+}
+
+func (a *relayActivity) touch() {
+	a.last.Store(time.Now().UnixNano())
+}
+
+func (a *relayActivity) idleFor() time.Duration {
+	last := a.last.Load()
+	if last == 0 {
+		return 0
+	}
+	return time.Since(time.Unix(0, last))
+}
+
+type relayResult struct {
+	direction string
+	bytes     int64
+	duration  time.Duration
+	err       error
+}
+
+func (r relayResult) reason() string {
+	if r.err == nil || errors.Is(r.err, io.EOF) {
+		return "eof"
+	}
+	return r.err.Error()
+}
+
+// relay copies a CONNECT/SOCKS5 tunnel in both directions.
 //
-// SSE-safe: uses a small copy buffer (4 KB) so that tiny streaming chunks are
-// forwarded immediately instead of being batched into a 32 KB flush. Does NOT
-// half-close on one-direction completion — some servers (notably Google SSE
-// endpoints) treat the client's half-close as an end-of-stream signal and will
-// tear down the response. Instead we let both goroutines finish naturally and
-// close everything at the end.
+// Important behavior:
+//   - No per-direction idle timeout is allowed to close the tunnel.
+//   - No half-close is sent when one lane ends; Google/Gmail may interpret that
+//     as end-of-stream and abort TLS, which Firefox reports as PR_END_OF_FILE_ERROR.
+//   - A shared tunnel idle watchdog closes both sockets only when neither lane
+//     has moved bytes for tunnelIdleTimeout.
 func relay(id uint32, label, host string, client net.Conn, clientReader io.Reader, remote net.Conn) {
 	tr, done := registerRoutine("relay", id, host)
 	defer done()
@@ -722,37 +858,81 @@ func relay(id uint32, label, host string, client net.Conn, clientReader io.Reade
 	activeRelays.Add(1)
 	defer activeRelays.Add(-1)
 
+	start := time.Now()
+	activity := newRelayActivity()
+	doneCh := make(chan relayResult, 2)
+
 	logf("REQ-%05d | TUNNEL | open %s %s", id, label, host)
 
-	var wg sync.WaitGroup
-	wg.Add(2)
-
-	// Lane 1: Browser -> Remote (Upload)
-	// If the browser half-closes, this lane finishes quietly without destroying the socket.
+	// Lane 1: Browser -> Remote (Upload). It may be idle for a long time while
+	// Gmail/Google is still sending data back, so read timeouts inside this lane
+	// are polling events only; they are not tunnel close signals.
 	goTracked("relay-upload", id, host, func(lane *trackedRoutine) {
-		defer wg.Done()
-		copyStreaming(remote, clientReader, remote, client, id, label, host, "From Browser", lane)
-		closeWrite(remote)
+		doneCh <- copyStreaming(remote, clientReader, remote, client, activity, "Browser->Remote", lane)
 	})
 
-	// Lane 2: Remote -> Browser (Download)
+	// Lane 2: Remote -> Browser (Download).
 	goTracked("relay-download", id, host, func(lane *trackedRoutine) {
-		defer wg.Done()
-		copyStreaming(client, remote, client, remote, id, label, host, "From Remote", lane)
-		closeWrite(client)
+		doneCh <- copyStreaming(client, remote, client, remote, activity, "Remote->Browser", lane)
 	})
 
-	// Wait gracefully for BOTH directions to naturally conclude or hit the timeout.
 	if tr != nil {
 		tr.setState("wait lanes")
 	}
-	wg.Wait()
 
-	// Safe, synchronized teardown
+	var first relayResult
+	closedByIdle := false
+	ticker := time.NewTicker(relayWatchdogInterval)
+
+waitFirst:
+	for {
+		select {
+		case first = <-doneCh:
+			break waitFirst
+		case <-ticker.C:
+			idle := activity.idleFor()
+			if idle >= tunnelIdleTimeout {
+				closedByIdle = true
+				if tr != nil {
+					tr.setState("idle timeout")
+				}
+				logf("REQ-%05d | TUNNEL | idle-timeout %s %s idle=%v", id, label, host, idle.Truncate(time.Second))
+				_ = client.Close()
+				_ = remote.Close()
+				break waitFirst
+			}
+		}
+	}
+	ticker.Stop()
+
+	if closedByIdle {
+		// Both sockets were closed by the shared idle watchdog. Drain both lane
+		// results so the log shows which side observed the close first.
+		for i := 0; i < 2; i++ {
+			res := <-doneCh
+			logf("REQ-%05d | TUNNEL | lane-done %s %s dir=%s bytes=%d dur=%v reason=%s",
+				id, label, host, res.direction, res.bytes, res.duration.Truncate(time.Millisecond), res.reason())
+		}
+		logf("REQ-%05d | TUNNEL | closed %s %s dur=%v reason=shared-idle-timeout",
+			id, label, host, time.Since(start).Truncate(time.Millisecond))
+		return
+	}
+
+	if tr != nil {
+		tr.setState("closing: " + first.reason())
+	}
+	logf("REQ-%05d | TUNNEL | lane-done %s %s dir=%s bytes=%d dur=%v reason=%s",
+		id, label, host, first.direction, first.bytes, first.duration.Truncate(time.Millisecond), first.reason())
+	// Close both ends together. This avoids the old aggressive half-close while
+	// still unblocking the opposite goroutine after one side really ended.
 	_ = client.Close()
 	_ = remote.Close()
 
-	logf("REQ-%05d | TUNNEL | closed %s %s", id, label, host)
+	second := <-doneCh
+	logf("REQ-%05d | TUNNEL | lane-done %s %s dir=%s bytes=%d dur=%v reason=%s",
+		id, label, host, second.direction, second.bytes, second.duration.Truncate(time.Millisecond), second.reason())
+	logf("REQ-%05d | TUNNEL | closed %s %s dur=%v reason=%s",
+		id, label, host, time.Since(start).Truncate(time.Millisecond), first.reason())
 }
 
 func writeFull(dst io.Writer, p []byte) error {
@@ -771,39 +951,46 @@ func writeFull(dst io.Writer, p []byte) error {
 	return nil
 }
 
-// copyStreaming implements a sliding idle timeout.
-// Every successful read/write updates the debug routine last-activity time.
-func copyStreaming(dst io.Writer, src io.Reader, rawDst net.Conn, rawSrc net.Conn, id uint32, label, host string, direction string, tr *trackedRoutine) {
+// copyStreaming forwards bytes for one tunnel direction. It intentionally does
+// not set per-lane read deadlines. Actual tunnel lifetime is controlled by
+// relay() using shared activity across both lanes; the watchdog closes the raw
+// sockets to unblock these reads.
+func copyStreaming(dst io.Writer, src io.Reader, rawDst net.Conn, rawSrc net.Conn, activity *relayActivity, direction string, tr *trackedRoutine) relayResult {
 	buf := make([]byte, 4096)
-	timeout := 3 * time.Minute
-	for {
-		// Reset dead man's switch
-		_ = rawSrc.SetReadDeadline(time.Now().Add(timeout))
-		_ = rawDst.SetWriteDeadline(time.Now().Add(timeout))
-		if tr != nil {
-			tr.setState("read " + direction)
-		}
+	started := time.Now()
+	var total int64
 
+	if tr != nil {
+		tr.setState("read " + direction)
+	}
+
+	for {
 		nr, rerr := src.Read(buf)
 		if nr > 0 {
+			activity.touch()
 			if tr != nil {
 				tr.setState("write " + direction)
 			}
+			_ = rawDst.SetWriteDeadline(time.Now().Add(tunnelIdleTimeout))
 			if err := writeFull(dst, buf[:nr]); err != nil {
 				if tr != nil {
 					tr.setState("write error: " + err.Error())
 				}
-				return
+				return relayResult{direction: direction, bytes: total, duration: time.Since(started), err: err}
 			}
+			total += int64(nr)
+			activity.touch()
 			if tr != nil {
 				tr.addBytes(nr)
+				tr.setState("read " + direction)
 			}
 		}
+
 		if rerr != nil {
 			if tr != nil {
 				tr.setState("done: " + rerr.Error())
 			}
-			return
+			return relayResult{direction: direction, bytes: total, duration: time.Since(started), err: rerr}
 		}
 	}
 }
@@ -973,7 +1160,7 @@ func handleHTTP(r *Resolver, client net.Conn) {
 	tuneTCP(remote)
 
 	if method == "CONNECT" {
-		if _, err := client.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
+		if err := writeFull(client, []byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
 			remote.Close()
 			return
 		}
@@ -1001,6 +1188,11 @@ func handleHTTP(r *Resolver, client net.Conn) {
 func readFull(c net.Conn, buf []byte) error {
 	_, err := io.ReadFull(c, buf)
 	return err
+}
+
+func writeSOCKS5Reply(client net.Conn, rep byte) error {
+	// VER, REP, RSV, ATYP, BND.ADDR=0.0.0.0, BND.PORT=0
+	return writeFull(client, []byte{0x05, rep, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 }
 
 func handleSOCKS5(r *Resolver, client net.Conn) {
@@ -1032,10 +1224,10 @@ func handleSOCKS5(r *Resolver, client net.Conn) {
 		}
 	}
 	if !ok {
-		client.Write([]byte{0x05, 0xFF})
+		_ = writeFull(client, []byte{0x05, 0xFF})
 		return
 	}
-	if _, err := client.Write([]byte{0x05, 0x00}); err != nil {
+	if err := writeFull(client, []byte{0x05, 0x00}); err != nil {
 		return
 	}
 
@@ -1051,7 +1243,7 @@ func handleSOCKS5(r *Resolver, client net.Conn) {
 	atyp := req[3]
 
 	if cmd != 0x01 { // CONNECT only
-		client.Write([]byte{0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		_ = writeSOCKS5Reply(client, 0x07)
 		return
 	}
 
@@ -1078,9 +1270,13 @@ func handleSOCKS5(r *Resolver, client net.Conn) {
 		if err := readFull(client, addr); err != nil {
 			return
 		}
-		host = "[" + net.IP(addr).String() + "]"
+		// Keep host unbracketed. net.JoinHostPort() adds brackets for IPv6.
+		// The old code pre-bracketed IPv6 and produced invalid targets like
+		// [[2607:f8b0:...]]:443, which breaks Firefox SOCKS5 when local DNS
+		// returns an IPv6 address for Gmail.
+		host = net.IP(addr).String()
 	default:
-		client.Write([]byte{0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		_ = writeSOCKS5Reply(client, 0x08)
 		return
 	}
 
@@ -1091,14 +1287,19 @@ func handleSOCKS5(r *Resolver, client net.Conn) {
 	port := binary.BigEndian.Uint16(portBuf)
 	target := net.JoinHostPort(host, fmt.Sprintf("%d", port))
 
+	// The SOCKS request is fully read. Clear the handshake deadline before the
+	// outbound WG/netstack dial, otherwise a slow dial can leave an expired client
+	// read deadline behind for the TLS relay.
+	_ = client.SetReadDeadline(time.Time{})
+
 	logf("REQ-%05d | SOCKS5 | CONNECT %s", id, target)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	remote, err := r.DialHostPort(ctx, target)
 	cancel()
 	if err != nil {
-		logf("REQ-%05d | ERR    | dial %s: %v", id, target, err)
-		client.Write([]byte{0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		logf("REQ-%05d | ERR    | SOCKS5 dial %s: %v", id, target, err)
+		_ = writeSOCKS5Reply(client, 0x05)
 		return
 	}
 
@@ -1106,7 +1307,7 @@ func handleSOCKS5(r *Resolver, client net.Conn) {
 	tuneTCP(remote)
 
 	// Success reply (bind addr/port = 0)
-	if _, err := client.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}); err != nil {
+	if err := writeSOCKS5Reply(client, 0x00); err != nil {
 		remote.Close()
 		return
 	}
@@ -1560,7 +1761,8 @@ func main() {
 	}
 	logf("SYS | READY | wireguard up")
 
-	resolver := newResolver(tnet, cfg.DNSServers, cfg.DNSCacheTTL, cfg.HostOverrides)
+	resolver := newResolver(tnet, cfg.DNSServers, cfg.DNSCacheTTL, cfg.HostOverrides, cfg.WGLocalIPs)
+	logf("SYS | INFO  | ip mode: ipv4=%v ipv6=%v dns_order=ipv4-first", resolver.allowIPv4, resolver.allowIPv6)
 
 	httpLn, err := net.Listen("tcp", cfg.HTTPListen)
 	if err != nil {
