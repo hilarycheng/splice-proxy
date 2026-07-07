@@ -840,14 +840,33 @@ func (r relayResult) reason() string {
 	return r.err.Error()
 }
 
+func (r relayResult) cleanEOF() bool {
+	return r.err == nil || errors.Is(r.err, io.EOF)
+}
+
+type closeWriteConn interface {
+	CloseWrite() error
+}
+
+// closeWrite forwards a client-side TCP FIN to the remote peer without closing
+// the still-active download lane. This is important for Java/IntelliJ HTTP
+// CONNECT downloads: some clients finish the upload side first and still expect
+// the response body to drain cleanly instead of seeing a premature EOF.
+func closeWrite(c net.Conn) error {
+	if cw, ok := c.(closeWriteConn); ok {
+		return cw.CloseWrite()
+	}
+	return errors.New("CloseWrite unsupported")
+}
+
 // relay copies a CONNECT/SOCKS5 tunnel in both directions.
 //
 // Important behavior:
 //   - No per-direction idle timeout is allowed to close the tunnel.
-//   - No half-close is sent when one lane ends; Google/Gmail may interpret that
-//     as end-of-stream and abort TLS, which Firefox reports as PR_END_OF_FILE_ERROR.
-//   - A shared tunnel idle watchdog closes both sockets only when neither lane
-//     has moved bytes for tunnelIdleTimeout.
+//   - A clean Browser->Remote EOF is treated as upload completion only; the
+//     Remote->Browser lane is allowed to keep draining the download body.
+//   - Remote->Browser completion/error, non-EOF upload errors, or shared tunnel
+//     idle timeout still close both sockets to unblock the opposite lane.
 func relay(id uint32, label, host string, client net.Conn, clientReader io.Reader, remote net.Conn) {
 	tr, done := registerRoutine("relay", id, host)
 	defer done()
@@ -864,9 +883,9 @@ func relay(id uint32, label, host string, client net.Conn, clientReader io.Reade
 
 	logf("REQ-%05d | TUNNEL | open %s %s", id, label, host)
 
-	// Lane 1: Browser -> Remote (Upload). It may be idle for a long time while
-	// Gmail/Google is still sending data back, so read timeouts inside this lane
-	// are polling events only; they are not tunnel close signals.
+	// Lane 1: Browser -> Remote (Upload). It may finish before the download lane
+	// for Java/IntelliJ CONNECT downloads. A clean EOF must not hard-close the
+	// remote-to-client response path.
 	goTracked("relay-upload", id, host, func(lane *trackedRoutine) {
 		doneCh <- copyStreaming(remote, clientReader, remote, client, activity, "Browser->Remote", lane)
 	})
@@ -880,59 +899,62 @@ func relay(id uint32, label, host string, client net.Conn, clientReader io.Reade
 		tr.setState("wait lanes")
 	}
 
-	var first relayResult
-	closedByIdle := false
+	doneCount := 0
+	closed := false
+	closeReason := "both-lanes-done"
 	ticker := time.NewTicker(relayWatchdogInterval)
+	defer ticker.Stop()
 
-waitFirst:
-	for {
+	closeBoth := func(reason string) {
+		if closed {
+			return
+		}
+		closed = true
+		closeReason = reason
+		if tr != nil {
+			tr.setState("closing: " + reason)
+		}
+		_ = client.Close()
+		_ = remote.Close()
+	}
+
+	for doneCount < 2 {
 		select {
-		case first = <-doneCh:
-			break waitFirst
+		case res := <-doneCh:
+			doneCount++
+			logf("REQ-%05d | TUNNEL | lane-done %s %s dir=%s bytes=%d dur=%v reason=%s",
+				id, label, host, res.direction, res.bytes, res.duration.Truncate(time.Millisecond), res.reason())
+
+			if res.direction == "Browser->Remote" && res.cleanEOF() && !closed {
+				if tr != nil {
+					tr.setState("upload eof; drain download")
+				}
+				if err := closeWrite(remote); err != nil {
+					logf("REQ-%05d | TUNNEL | upload-eof %s %s closewrite=skip reason=%v",
+						id, label, host, err)
+				} else {
+					logf("REQ-%05d | TUNNEL | upload-eof %s %s remote-write-closed; draining download",
+						id, label, host)
+				}
+				continue
+			}
+
+			// Remote->Browser completion means the response body is done. A non-EOF
+			// upload error means the client side is no longer reliable. In both cases,
+			// close both sockets and drain the remaining lane result.
+			closeBoth(res.reason())
+
 		case <-ticker.C:
 			idle := activity.idleFor()
 			if idle >= tunnelIdleTimeout {
-				closedByIdle = true
-				if tr != nil {
-					tr.setState("idle timeout")
-				}
 				logf("REQ-%05d | TUNNEL | idle-timeout %s %s idle=%v", id, label, host, idle.Truncate(time.Second))
-				_ = client.Close()
-				_ = remote.Close()
-				break waitFirst
+				closeBoth("shared-idle-timeout")
 			}
 		}
 	}
-	ticker.Stop()
 
-	if closedByIdle {
-		// Both sockets were closed by the shared idle watchdog. Drain both lane
-		// results so the log shows which side observed the close first.
-		for i := 0; i < 2; i++ {
-			res := <-doneCh
-			logf("REQ-%05d | TUNNEL | lane-done %s %s dir=%s bytes=%d dur=%v reason=%s",
-				id, label, host, res.direction, res.bytes, res.duration.Truncate(time.Millisecond), res.reason())
-		}
-		logf("REQ-%05d | TUNNEL | closed %s %s dur=%v reason=shared-idle-timeout",
-			id, label, host, time.Since(start).Truncate(time.Millisecond))
-		return
-	}
-
-	if tr != nil {
-		tr.setState("closing: " + first.reason())
-	}
-	logf("REQ-%05d | TUNNEL | lane-done %s %s dir=%s bytes=%d dur=%v reason=%s",
-		id, label, host, first.direction, first.bytes, first.duration.Truncate(time.Millisecond), first.reason())
-	// Close both ends together. This avoids the old aggressive half-close while
-	// still unblocking the opposite goroutine after one side really ended.
-	_ = client.Close()
-	_ = remote.Close()
-
-	second := <-doneCh
-	logf("REQ-%05d | TUNNEL | lane-done %s %s dir=%s bytes=%d dur=%v reason=%s",
-		id, label, host, second.direction, second.bytes, second.duration.Truncate(time.Millisecond), second.reason())
 	logf("REQ-%05d | TUNNEL | closed %s %s dur=%v reason=%s",
-		id, label, host, time.Since(start).Truncate(time.Millisecond), first.reason())
+		id, label, host, time.Since(start).Truncate(time.Millisecond), closeReason)
 }
 
 func writeFull(dst io.Writer, p []byte) error {
@@ -1118,11 +1140,18 @@ func cleanRequest(raw []byte) []byte {
 			continue
 		}
 		lo := strings.ToLower(line)
-		if strings.HasPrefix(lo, "proxy-connection:") || strings.HasPrefix(lo, "proxy-authorization:") {
+		if strings.HasPrefix(lo, "proxy-connection:") ||
+			strings.HasPrefix(lo, "proxy-authorization:") ||
+			strings.HasPrefix(lo, "connection:") ||
+			strings.HasPrefix(lo, "keep-alive:") {
 			continue
 		}
 		out = append(out, line)
 	}
+	// Plain HTTP proxying is one-request-per-connection in splice-proxy. Force
+	// origin close so copyBuffered() can finish deterministically instead of
+	// waiting on server keep-alive behavior.
+	out = append(out, "Connection: close")
 	result := strings.Join(out, "\r\n") + "\r\n\r\n"
 	if len(body) > 0 {
 		return append([]byte(result), body...)
@@ -1173,13 +1202,18 @@ func handleHTTP(r *Resolver, client net.Conn) {
 
 		relay(id, "HTTP", host, client, clientReader, remote)
 	} else {
-		if _, err := remote.Write(cleanRequest(raw)); err != nil {
+		if err := writeFull(remote, cleanRequest(raw)); err != nil {
+			logf("REQ-%05d | ERR    | plain-http request write %s: %v", id, host, err)
 			remote.Close()
 			return
 		}
-		copyBuffered(client, remote)
+		n, err := copyBuffered(client, remote)
 		remote.Close()
-		logf("REQ-%05d | DONE   | %s", id, host)
+		if err != nil && !errors.Is(err, io.EOF) {
+			logf("REQ-%05d | ERR    | plain-http response copy %s bytes=%d: %v", id, host, n, err)
+			return
+		}
+		logf("REQ-%05d | DONE   | %s bytes=%d", id, host, n)
 	}
 }
 
