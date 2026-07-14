@@ -118,6 +118,15 @@ func normalizeRoutePattern(pattern string) (string, error) {
 	if pattern == "" {
 		return "", errors.New("hostname is empty")
 	}
+	if prefix, err := netip.ParsePrefix(pattern); err == nil {
+		return prefix.Masked().String(), nil
+	}
+	if strings.Contains(pattern, "/") {
+		return "", errors.New("invalid CIDR")
+	}
+	if ip, err := netip.ParseAddr(strings.Trim(pattern, "[]")); err == nil {
+		return ip.Unmap().String(), nil
+	}
 	if strings.HasPrefix(pattern, "*.") {
 		if len(pattern) == 2 || strings.Contains(pattern[2:], "*") {
 			return "", errors.New("invalid wildcard hostname")
@@ -549,7 +558,14 @@ type wildcardEntry struct {
 type routeRuleSet struct {
 	defaultAction routeAction
 	exact         map[string]routeAction
+	prefixes      []routePrefixEntry
 	wildcards     []routeWildcardEntry
+}
+
+type routePrefixEntry struct {
+	prefix  netip.Prefix
+	pattern string
+	action  routeAction
 }
 
 type routeWildcardEntry struct {
@@ -565,6 +581,14 @@ func newRouteRuleSet(defaultAction routeAction, routes map[string]routeAction) r
 		exact:         make(map[string]routeAction),
 	}
 	for pattern, action := range routes {
+		if prefix, err := netip.ParsePrefix(pattern); err == nil {
+			r.prefixes = append(r.prefixes, routePrefixEntry{
+				prefix:  prefix.Masked(),
+				pattern: prefix.Masked().String(),
+				action:  action,
+			})
+			continue
+		}
 		if strings.HasPrefix(pattern, "*.") {
 			r.wildcards = append(r.wildcards, routeWildcardEntry{
 				suffix:   pattern[1:],
@@ -575,7 +599,7 @@ func newRouteRuleSet(defaultAction routeAction, routes map[string]routeAction) r
 			continue
 		}
 		r.exact[pattern] = action
-		if net.ParseIP(pattern) != nil {
+		if _, err := netip.ParseAddr(pattern); err == nil {
 			continue
 		}
 		r.wildcards = append(r.wildcards, routeWildcardEntry{
@@ -584,6 +608,9 @@ func newRouteRuleSet(defaultAction routeAction, routes map[string]routeAction) r
 			action:  action,
 		})
 	}
+	sort.Slice(r.prefixes, func(i, j int) bool {
+		return r.prefixes[i].prefix.Bits() > r.prefixes[j].prefix.Bits()
+	})
 	sort.Slice(r.wildcards, func(i, j int) bool {
 		if len(r.wildcards[i].suffix) != len(r.wildcards[j].suffix) {
 			return len(r.wildcards[i].suffix) > len(r.wildcards[j].suffix)
@@ -604,6 +631,14 @@ func (r routeRuleSet) matchDetail(host string) (routeAction, string) {
 	host = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
 	if action, ok := r.exact[host]; ok {
 		return action, host
+	}
+	if ip, err := netip.ParseAddr(strings.Trim(host, "[]")); err == nil {
+		ip = ip.Unmap()
+		for _, rule := range r.prefixes {
+			if rule.prefix.Contains(ip) {
+				return rule.action, rule.pattern
+			}
+		}
 	}
 	for _, rule := range r.wildcards {
 		if strings.HasSuffix(host, rule.suffix) {
@@ -1060,13 +1095,20 @@ func (r *Resolver) DialHostPort(ctx context.Context, reqID uint32, hostport stri
 	for _, ip := range ips {
 		addr := net.JoinHostPort(ip, port)
 		attempted = append(attempted, addr)
+		dialAction := action
+		if rule == "default" {
+			if ipAction, ipRule := r.matchRoute(ip); ipRule != "default" {
+				dialAction = ipAction
+				logf("REQ-%05d | ROUTE  | %s via=%s rule=%s", reqID, addr, dialAction, ipRule)
+			}
+		}
 		if tr != nil {
 			tr.setState("connect " + addr)
 		}
 		dctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		started := time.Now()
 		var c net.Conn
-		if action == routeDirect {
+		if dialAction == routeDirect {
 			c, err = r.direct.DialContext(dctx, "tcp", addr)
 		} else {
 			c, err = r.tnet.DialContext(dctx, "tcp", addr)
@@ -1075,11 +1117,11 @@ func (r *Resolver) DialHostPort(ctx context.Context, reqID uint32, hostport stri
 		cancel()
 		if err == nil {
 			logf("REQ-%05d | DIAL   | route=%s addr=%s dur=%v result=connected",
-				reqID, action, addr, duration.Truncate(time.Millisecond))
+				reqID, dialAction, addr, duration.Truncate(time.Millisecond))
 			return c, nil
 		}
 		logf("REQ-%05d | DIAL   | route=%s addr=%s dur=%v result=failed error=%v",
-			reqID, action, addr, duration.Truncate(time.Millisecond), err)
+			reqID, dialAction, addr, duration.Truncate(time.Millisecond), err)
 		lastErr = err
 	}
 	return nil, fmt.Errorf("dial %s via %s %v: %w", hostport, action, attempted, lastErr)
@@ -2349,8 +2391,45 @@ func writeDiagnosticSnapshot(dev *device.Device, resolver *Resolver) error {
 	return nil
 }
 
+func printRouteAndSystemHosts(resolver *Resolver) {
+	rules := resolver.routes.Load()
+	if rules == nil {
+		fmt.Println("routes: unavailable")
+	} else {
+		entries := make([]string, 0, len(rules.exact)+len(rules.prefixes)+len(rules.wildcards))
+		for pattern, action := range rules.exact {
+			entries = append(entries, fmt.Sprintf("%s -> %s", pattern, action))
+		}
+		for _, rule := range rules.prefixes {
+			entries = append(entries, fmt.Sprintf("%s -> %s", rule.pattern, rule.action))
+		}
+		for _, rule := range rules.wildcards {
+			if rule.explicit {
+				entries = append(entries, fmt.Sprintf("%s -> %s", rule.pattern, rule.action))
+			}
+		}
+		sort.Strings(entries)
+		fmt.Printf("routes: default -> %s, rules=%d\n", rules.defaultAction, len(entries))
+		for _, entry := range entries {
+			fmt.Printf("  %s\n", entry)
+		}
+	}
+
+	resolver.systemHostsMu.RLock()
+	hosts := make([]string, 0, len(resolver.systemHosts))
+	for host := range resolver.systemHosts {
+		hosts = append(hosts, host)
+	}
+	resolver.systemHostsMu.RUnlock()
+	sort.Strings(hosts)
+	fmt.Printf("system hosts: names=%d source=%s\n", len(hosts), systemHostsFilePath())
+	for _, host := range hosts {
+		fmt.Printf("  %s\n", host)
+	}
+}
+
 func debugConsoleLoop(tnet *netstack.Net, dev *device.Device, resolver *Resolver) {
-	fmt.Println("\nDebug console enabled. Commands: h=help, s=summary, r=routines, x=diagnostic snapshot, d=dump goroutines, p=ping now, q=exit now")
+	fmt.Println("\nDebug console enabled. Commands: h=help, s=summary, l=route/hosts lists, r=routines, x=diagnostic snapshot, d=dump goroutines, p=ping now, q=exit now")
 	sc := bufio.NewScanner(os.Stdin)
 	for {
 		fmt.Print("splice-proxy> ")
@@ -2360,9 +2439,11 @@ func debugConsoleLoop(tnet *netstack.Net, dev *device.Device, resolver *Resolver
 		cmd := strings.ToLower(strings.TrimSpace(sc.Text()))
 		switch cmd {
 		case "", "h", "help", "?":
-			fmt.Println("Commands: s=summary, r=routines with START/AGE/IDLE, x=diagnostic snapshot, d=write full goroutine dump, p=ICMP ping now, q=exit now")
+			fmt.Println("Commands: s=summary, l=current route/system-host lists, r=routines with START/AGE/IDLE, x=diagnostic snapshot, d=write full goroutine dump, p=ICMP ping now, q=exit now")
 		case "s", "summary":
 			printSummary(dev, resolver)
+		case "l", "lists":
+			printRouteAndSystemHosts(resolver)
 		case "r", "routines":
 			printRoutines()
 		case "d", "dump":

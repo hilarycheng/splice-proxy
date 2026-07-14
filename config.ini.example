@@ -26,8 +26,9 @@ reload_interval_seconds = 0
 ; Per-domain outbound routing. A rule matches the domain itself and all of its
 ; subdomains. The longest matching domain wins. Domain-label boundaries apply:
 ; example.com matches a.b.example.com, but not notexample.com.
-; A literal IP rule matches only that exact IP. CIDR/netmask rules are not
-; supported (for example, 192.168.0.0/16 is not a valid route rule).
+; A literal IP rule matches only that exact IP. CIDR rules match literal,
+; [hosts], and DNS-resolved addresses. Exact IP wins over CIDR; otherwise the
+; longest matching CIDR prefix wins.
 ;
 ; Direct routes use system DNS and the normal local network. WireGuard routes
 ; use the DNS servers below and the embedded tunnel.
@@ -40,6 +41,7 @@ reload_interval_seconds = 0
 ; example.com         = direct
 ; secure.example.com  = wireguard
 ; 192.0.2.10          = direct
+; 192.168.0.0/16      = direct
 
 [wireguard]
 ; Your client's private key (base64).

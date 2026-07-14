@@ -29,6 +29,7 @@ reload_interval_seconds = 0
 example.com         = direct
 secure.example.com  = wireguard
 192.0.2.10          = direct
+192.168.0.0/16      = direct
 ```
 
 Routing behavior:
@@ -49,10 +50,11 @@ Routing behavior:
   through the embedded WireGuard stack.
 - Domain matching respects label boundaries, so `example.com` does not match
   `notexample.com`.
-- A literal IP rule matches only that exact IP. CIDR and netmask route rules,
-  such as `192.168.0.0/16`, are not supported.
+- A literal IP rule matches only that exact IP. CIDR rules match literal,
+  `[hosts]`, and DNS-resolved addresses. Exact IP rules take priority over CIDR
+  rules; otherwise the longest matching CIDR prefix wins.
 - Host rules require the client to send a hostname. If a SOCKS5 client sends a
-  literal IP address, only an exact IP rule can match because the proxy cannot
+  literal IP address, exact IP and CIDR rules can match, but the proxy cannot
   recover the original hostname.
 
 The system hosts file is read at startup and periodically reloaded for route
@@ -70,13 +72,15 @@ selection follows this order:
 1. Match the requested hostname in `[routes]`.
 2. If unmatched and the hostname is in the operating system hosts file, use
    `direct`.
-3. If unmatched and `[hosts]` supplies a static IP, match that exact IP in
-   `[routes]`.
-4. If still unmatched, use `routing.default`, which is `wireguard` when omitted.
+3. If unmatched and `[hosts]` supplies a static IP, match that IP against exact
+   and CIDR rules in `[routes]`.
+4. If still unmatched, use `routing.default`, which is `wireguard` when omitted,
+   to resolve the hostname.
+5. Match each resolved IP against exact and CIDR rules before connecting.
 
 The static IP is used for the connection regardless of the selected route.
-Hosts not defined in `[hosts]` skip step 3; the proxy does not perform DNS merely
-to choose a route.
+Hosts not defined in `[hosts]` skip step 3. A route selected from a resolved IP
+changes the connection path but keeps the DNS path selected in step 4.
 
 An HTTP or SOCKS5 proxy cannot send a standard response that tells a client to
 retry one request directly. A rejected request is normally just a failure.
@@ -117,7 +121,10 @@ dials, relays, memory, garbage collection, and goroutine counts. A single
 snapshot command will capture this information before restart so slow or stuck
 behavior can be compared with the fresh process.
 
-Run with `--debug-console` and enter `x` to write a timestamped
+Run with `--debug-console` and enter `l` to print the current sorted route rules
+and operating-system host names. The output identifies `/etc/hosts` on Linux or
+`%SystemRoot%\System32\drivers\etc\hosts` on Windows and reflects successful
+dynamic reloads. Enter `x` to write a timestamped
 `diagnostic-*.txt` snapshot containing runtime counters, health results, tracked
 routines, and goroutine stacks. Request logs and snapshots never include traffic
 payloads, credentials, WireGuard private keys, or proxy authorization values.

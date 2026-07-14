@@ -30,6 +30,7 @@ reload_interval_seconds = 0
 example.com         = direct
 secure.example.com  = wireguard
 192.0.2.10          = direct
+192.168.0.0/16      = direct
 ```
 
 ### Rule Selection
@@ -37,8 +38,10 @@ secure.example.com  = wireguard
 1. Longest matching domain rule.
 2. A hostname in the operating system hosts file, or a built-in loopback target,
    uses `direct`.
-3. A matching static `[hosts]` IP rule.
-4. The `routing.default` action.
+3. A matching exact or CIDR rule for a static `[hosts]` IP.
+4. The `routing.default` action selects the DNS path.
+5. A matching exact or CIDR rule for each resolved IP selects its connection
+   path.
 
 Each domain rule matches the domain itself and all descendant subdomains.
 For example, `example.com` matches `example.com`, `a.example.com`, and
@@ -46,8 +49,8 @@ For example, `example.com` matches `example.com`, `a.example.com`, and
 a WireGuard exception such as `secure.example.com` inside the direct
 `example.com` rule.
 
-A literal IP rule matches only that exact address. CIDR and netmask route rules
-are not supported.
+A literal IP rule matches only that exact address. CIDR rules use longest-prefix
+matching, and an exact IP rule takes priority over every CIDR rule.
 
 ### Outbound Paths
 
@@ -57,9 +60,9 @@ are not supported.
 - **wireguard:** Preserve the current behavior: resolve through the configured
   WireGuard DNS servers and connect through the embedded WireGuard netstack.
 
-DNS results and connection attempts must remain associated with their selected
-path so a direct lookup or connection cannot accidentally use WireGuard, and a
-WireGuard lookup cannot leak to system DNS.
+An explicit hostname or system-host rule keeps its selected DNS and connection
+path. Otherwise, the default route selects DNS; exact or CIDR rules may then
+change the connection path for each resolved IP without repeating the lookup.
 
 The operating system hosts file is parsed at startup for hostname membership.
 Linux uses `/etc/hosts`; Windows uses
@@ -67,11 +70,12 @@ Linux uses `/etc/hosts`; Windows uses
 comments, blank lines, and malformed entries are ignored. Matching names use the
 direct path, while the OS resolver remains responsible for their actual address
 selection. Explicit hostname rules take priority. Built-in loopback targets are
-handled the same way. Restart is required after changing the system hosts file.
+handled the same way. When dynamic reload is enabled, successful hosts-file
+changes apply to new connections; otherwise a restart is required.
 
-For names in `[hosts]`, the mapping supplies the connection IP on either route.
-Names without a static mapping skip the IP-rule step; DNS is not performed merely
-to choose a route.
+For names in `[hosts]`, the mapping supplies the connection IP on either route
+and participates in exact and CIDR matching. Names without a static mapping are
+resolved using the hostname/default route before resolved-IP matching.
 
 ### Protocol Constraint
 
@@ -83,8 +87,7 @@ accept the request and perform the direct connection on the client's behalf.
 
 Hostname routing is possible only when the client sends a hostname. A SOCKS5
 request containing a literal IPv4 or IPv6 address cannot be mapped back reliably
-to its original domain, but it can match an exact literal IP route. CIDR routing
-is outside this initial requirement.
+to its original domain, but it can match an exact IP or CIDR route.
 
 ### Dynamic Route Reload
 
@@ -159,6 +162,10 @@ The active WireGuard probes run once after startup and every five minutes with
 short independent timeouts. They do not automatically restart the proxy.
 
 ### Runtime Snapshot
+
+When `--debug-console` is enabled, command `l` prints the current sorted route
+rules and system-host names used for direct classification. The output includes
+the platform hosts-file path and reads the live state after successful reloads.
 
 When `--debug-console` is enabled, command `x` captures a timestamped
 `diagnostic-*.txt` snapshot before manual restart containing:
