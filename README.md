@@ -14,6 +14,80 @@ Browser VPN extensions solve a similar problem (browser-only routing without tou
 
 The server and worker communicate over UDP using a custom Reliable UDP (RUDP) protocol, which avoids the TCP-over-TCP issues and WSL networking limitations that make a pure TCP approach unreliable at scale.
 
+## Selective Routing
+
+Splice-Proxy supports both direct and WireGuard host rules in the same
+application. This lets tools without proxy-exception support continue using
+Splice-Proxy for every request while the proxy selects the outbound route.
+
+```ini
+[routing]
+default = wireguard
+reload_interval_seconds = 0
+
+[routes]
+example.com         = direct
+*.example.com       = direct
+secure.example.com  = wireguard
+```
+
+Routing behavior:
+
+- An exact hostname rule wins over a wildcard rule.
+- The longest matching wildcard wins; otherwise `routing.default` is used.
+- `direct` resolves with the operating system DNS configuration and connects
+  through the normal local network, completely bypassing WireGuard.
+- `wireguard` resolves with the configured tunnel DNS servers and connects
+  through the embedded WireGuard stack.
+- `*.example.com` matches subdomains but not `example.com`; add both rules when
+  both must use the same route.
+- Host rules require the client to send a hostname. If a SOCKS5 client sends a
+  literal IP address, the proxy cannot recover the original hostname.
+
+An HTTP or SOCKS5 proxy cannot send a standard response that tells a client to
+retry one request directly. A rejected request is normally just a failure.
+Therefore, the proxy must make the selected direct connection itself. Client-side
+PAC, proxy bypass lists, and `NO_PROXY` remain alternatives for clients that
+support them.
+
+### Dynamic Route Reload
+
+`routing.reload_interval_seconds` controls periodic route reloads. `0`
+disables reload. When enabled, Splice-Proxy rereads only `[routing]` and
+`[routes]`, validates a complete new routing table, and atomically activates it.
+Invalid updates will be logged while the last valid table remains active.
+Changed content must be identical on two consecutive polls before activation,
+which prevents a temporary partial write from becoming live configuration.
+
+Reloaded rules will apply to new connections only. Existing HTTP CONNECT and
+SOCKS5 tunnels will keep their selected route until they disconnect. WireGuard
+settings, DNS servers, proxy listen addresses, and host overrides will remain
+startup-only settings.
+
+Changing the interval to `0` during reload stops the watcher. Restart is needed
+to enable it again because a disabled watcher cannot observe later file changes.
+
+### Connection Diagnostics
+
+An ICMP ping only proves that the WireGuard/netstack ICMP path is alive. It does
+not prove that DNS, TCP connection setup, proxy handlers, or relay throughput are
+healthy. Splice-Proxy logs per-request timing for DNS, outbound TCP connect,
+first response byte, transferred bytes, and relay speed.
+
+Every five minutes, and once immediately after startup, independent health checks
+probe WireGuard ICMP, tunnel DNS, TCP connection setup, and a small HTTPS
+response. A successful layer does not hide a failure in another layer.
+
+The diagnostic summary also reports active HTTP/SOCKS handlers, outbound
+dials, relays, memory, garbage collection, and goroutine counts. A single
+snapshot command will capture this information before restart so slow or stuck
+behavior can be compared with the fresh process.
+
+Run with `--debug-console` and enter `x` to write a timestamped
+`diagnostic-*.txt` snapshot containing runtime counters, health results, tracked
+routines, and goroutine stacks. Request logs and snapshots never include traffic
+payloads, credentials, WireGuard private keys, or proxy authorization values.
+
 ## Components
 
 | File              | Role                                                                                         |

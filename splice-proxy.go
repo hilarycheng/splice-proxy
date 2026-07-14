@@ -1,8 +1,8 @@
 // splice-proxy.go — Single-binary HTTP + SOCKS5 proxy with embedded WireGuard.
 //
 // Runs on Windows and Linux. No TUN driver. No admin rights. No kernel modules.
-// All traffic (including DNS) is routed through an embedded userspace WireGuard
-// tunnel via gVisor netstack.
+// Traffic is routed either through an embedded userspace WireGuard tunnel via
+// gVisor netstack or directly through the system network, according to config.
 //
 // Build:   go build -ldflags "-s -w" -o splice-proxy splice-proxy.go
 // Config:  config.ini (see README.md)
@@ -13,6 +13,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
@@ -28,6 +30,7 @@ import (
 	"runtime"
 	"runtime/pprof"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -82,21 +85,102 @@ type Config struct {
 	DNSServers  []string
 	DNSCacheTTL time.Duration
 
+	DefaultRoute routeAction
+	Routes       map[string]routeAction
+	RouteReload  time.Duration
+
 	// HostOverrides maps "host" or "*.suffix" to an IP string.
 	// Exact matches are checked first, then suffix wildcards (longest first).
 	HostOverrides map[string]string
 }
 
-func loadIni(path string) map[string]string {
-	m := make(map[string]string)
-	f, err := os.Open(path)
-	if err != nil {
-		return m
-	}
-	defer f.Close()
+type routeAction string
 
+const (
+	routeDirect    routeAction = "direct"
+	routeWireGuard routeAction = "wireguard"
+)
+
+func parseRouteAction(value string) (routeAction, error) {
+	switch routeAction(strings.ToLower(strings.TrimSpace(value))) {
+	case routeDirect:
+		return routeDirect, nil
+	case routeWireGuard:
+		return routeWireGuard, nil
+	default:
+		return "", fmt.Errorf("must be %q or %q", routeDirect, routeWireGuard)
+	}
+}
+
+func normalizeRoutePattern(pattern string) (string, error) {
+	pattern = strings.ToLower(strings.TrimSpace(pattern))
+	pattern = strings.TrimSuffix(pattern, ".")
+	if pattern == "" {
+		return "", errors.New("hostname is empty")
+	}
+	if strings.HasPrefix(pattern, "*.") {
+		if len(pattern) == 2 || strings.Contains(pattern[2:], "*") {
+			return "", errors.New("invalid wildcard hostname")
+		}
+		return pattern, nil
+	}
+	if strings.Contains(pattern, "*") {
+		return "", errors.New("wildcard is only supported as a leading *.")
+	}
+	return pattern, nil
+}
+
+func parseRoutingConfig(m map[string]string) (routeAction, map[string]routeAction, time.Duration, error) {
+	defaultValue, ok := m["routing.default"]
+	if !ok {
+		defaultValue = string(routeWireGuard)
+	}
+	defaultRoute, err := parseRouteAction(defaultValue)
+	if err != nil {
+		return "", nil, 0, fmt.Errorf("routing.default %s", err)
+	}
+	reloadSeconds := 0
+	if raw, ok := m["routing.reload_interval_seconds"]; ok {
+		reloadSeconds, err = strconv.Atoi(strings.TrimSpace(raw))
+		if err != nil {
+			return "", nil, 0, fmt.Errorf("routing.reload_interval_seconds must be an integer: %w", err)
+		}
+	}
+	if reloadSeconds < 0 {
+		return "", nil, 0, errors.New("routing.reload_interval_seconds must be 0 or greater")
+	}
+
+	routes := make(map[string]routeAction)
+	for k, v := range m {
+		if !strings.HasPrefix(k, "routes.") {
+			continue
+		}
+		name := strings.TrimPrefix(k, "routes.")
+		pattern, err := normalizeRoutePattern(name)
+		if err != nil {
+			return "", nil, 0, fmt.Errorf("[routes] %q: %w", name, err)
+		}
+		action, err := parseRouteAction(v)
+		if err != nil {
+			return "", nil, 0, fmt.Errorf("[routes] %q %s", pattern, err)
+		}
+		routes[pattern] = action
+	}
+	return defaultRoute, routes, time.Duration(reloadSeconds) * time.Second, nil
+}
+
+func loadIni(path string) map[string]string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return make(map[string]string)
+	}
+	return parseIniData(data)
+}
+
+func parseIniData(data []byte) map[string]string {
+	m := make(map[string]string)
 	section := ""
-	sc := bufio.NewScanner(f)
+	sc := bufio.NewScanner(bytes.NewReader(data))
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
 		if line == "" || line[0] == '#' || line[0] == ';' {
@@ -137,6 +221,10 @@ func iniGetInt(m map[string]string, key string, fallback int) int {
 
 func loadConfig(path string) (*Config, error) {
 	m := loadIni(path)
+	defaultRoute, routes, reloadInterval, err := parseRoutingConfig(m)
+	if err != nil {
+		return nil, fmt.Errorf("config: %w", err)
+	}
 
 	c := &Config{
 		HTTPListen:   iniGet(m, "proxy.http_listen", "127.0.0.1:12346"),
@@ -151,6 +239,10 @@ func loadConfig(path string) (*Config, error) {
 		WGMTU:              iniGetInt(m, "wireguard.mtu", 1420),
 
 		DNSCacheTTL: time.Duration(iniGetInt(m, "dns.cache_ttl_seconds", 300)) * time.Second,
+
+		DefaultRoute: defaultRoute,
+		Routes:       routes,
+		RouteReload:  reloadInterval,
 	}
 
 	// Local IPs (can be comma-separated for IPv4+IPv6 dual-stack)
@@ -427,6 +519,8 @@ type Resolver struct {
 	servers []string
 	cache   *dnsCache
 	nextSrv atomic.Uint32
+	direct  net.Dialer
+	routes  atomic.Pointer[routeRuleSet]
 
 	// Address-family mode comes from configured WG local IPs.
 	// If the tunnel has only IPv4 local addresses, avoid using IPv6 DNS answers
@@ -447,16 +541,72 @@ type wildcardEntry struct {
 	ip     string // "1.2.3.4"
 }
 
-func newResolver(tnet *netstack.Net, servers []string, ttl time.Duration, overrides map[string]string, localIPs []netip.Addr) *Resolver {
+type routeRuleSet struct {
+	defaultAction routeAction
+	exact         map[string]routeAction
+	wildcards     []routeWildcardEntry
+}
+
+type routeWildcardEntry struct {
+	suffix string
+	action routeAction
+}
+
+func newRouteRuleSet(defaultAction routeAction, routes map[string]routeAction) routeRuleSet {
+	r := routeRuleSet{
+		defaultAction: defaultAction,
+		exact:         make(map[string]routeAction),
+	}
+	for pattern, action := range routes {
+		if strings.HasPrefix(pattern, "*.") {
+			r.wildcards = append(r.wildcards, routeWildcardEntry{
+				suffix: pattern[1:],
+				action: action,
+			})
+			continue
+		}
+		r.exact[pattern] = action
+	}
+	sort.Slice(r.wildcards, func(i, j int) bool {
+		return len(r.wildcards[i].suffix) > len(r.wildcards[j].suffix)
+	})
+	return r
+}
+
+func (r routeRuleSet) match(host string) routeAction {
+	action, _ := r.matchDetail(host)
+	return action
+}
+
+func (r routeRuleSet) matchDetail(host string) (routeAction, string) {
+	host = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
+	if action, ok := r.exact[host]; ok {
+		return action, host
+	}
+	for _, rule := range r.wildcards {
+		if strings.HasSuffix(host, rule.suffix) {
+			return rule.action, "*" + rule.suffix
+		}
+	}
+	return r.defaultAction, "default"
+}
+
+func newResolver(tnet *netstack.Net, servers []string, ttl time.Duration, overrides map[string]string, localIPs []netip.Addr, defaultRoute routeAction, routes map[string]routeAction) *Resolver {
 	allowIPv4, allowIPv6 := addressFamilyMode(localIPs)
 	r := &Resolver{
-		tnet:       tnet,
-		servers:    servers,
-		cache:      newDNSCache(ttl),
+		tnet:    tnet,
+		servers: servers,
+		cache:   newDNSCache(ttl),
+		direct: net.Dialer{
+			Timeout:   5 * time.Second,
+			KeepAlive: 30 * time.Second,
+			Resolver:  net.DefaultResolver,
+		},
 		allowIPv4:  allowIPv4,
 		allowIPv6:  allowIPv6,
 		exactHosts: make(map[string]string),
 	}
+	r.replaceRoutes(defaultRoute, routes)
 	for host, ip := range overrides {
 		host = strings.ToLower(host)
 		if strings.HasPrefix(host, "*.") {
@@ -472,6 +622,69 @@ func newResolver(tnet *netstack.Net, servers []string, ttl time.Duration, overri
 	// Longest suffix wins: sort descending by length
 	sortWildcardsLongestFirst(r.wildcardHosts)
 	return r
+}
+
+func (r *Resolver) replaceRoutes(defaultAction routeAction, routes map[string]routeAction) {
+	rules := newRouteRuleSet(defaultAction, routes)
+	r.routes.Store(&rules)
+}
+
+func (r *Resolver) matchRoute(host string) (routeAction, string) {
+	rules := r.routes.Load()
+	if rules == nil {
+		return routeWireGuard, "default"
+	}
+	return rules.matchDetail(host)
+}
+
+func routeReloadLoop(path string, resolver *Resolver, initialInterval time.Duration) {
+	interval := initialInterval
+	timer := time.NewTimer(0)
+	defer timer.Stop()
+
+	var observedHash, processedHash [sha256.Size]byte
+	haveObserved := false
+	haveProcessed := false
+	stableReads := 0
+	for {
+		<-timer.C
+		data, err := os.ReadFile(path)
+		if err != nil {
+			logf("SYS | ROUTE | reload read failed; keeping last valid routes: %v", err)
+			haveObserved = false
+			stableReads = 0
+		} else {
+			hash := sha256.Sum256(data)
+			if !haveObserved || hash != observedHash {
+				haveObserved = true
+				observedHash = hash
+				stableReads = 1
+			} else {
+				stableReads++
+			}
+			if stableReads >= 2 && (!haveProcessed || hash != processedHash) {
+				haveProcessed = true
+				processedHash = hash
+				defaultRoute, routes, nextInterval, parseErr := parseRoutingConfig(parseIniData(data))
+				if parseErr != nil {
+					logf("SYS | ROUTE | reload rejected; keeping last valid routes: %v", parseErr)
+				} else {
+					resolver.replaceRoutes(defaultRoute, routes)
+					logf("SYS | ROUTE | reloaded default=%s rules=%d", defaultRoute, len(routes))
+					if nextInterval != interval {
+						interval = nextInterval
+						logf("SYS | ROUTE | reload interval changed to %v", interval)
+					}
+				}
+			}
+		}
+
+		if interval <= 0 {
+			logf("SYS | ROUTE | dynamic reload disabled; restart required to enable it again")
+			return
+		}
+		timer.Reset(interval)
+	}
 }
 
 func sortWildcardsLongestFirst(ws []wildcardEntry) {
@@ -588,26 +801,26 @@ func (r *Resolver) resolverForGo() *net.Resolver {
 	}
 }
 
-// Resolve returns at least one IP for host, using cache when possible.
-func (r *Resolver) Resolve(ctx context.Context, host string) ([]string, error) {
+// resolveWireGuard returns at least one IP plus the resolution source.
+func (r *Resolver) resolveWireGuard(ctx context.Context, host string) ([]string, string, error) {
 	// If already an IP, pass through only when the configured WireGuard
 	// address family can actually route it. This matters for Firefox SOCKS5
 	// when "Proxy DNS when using SOCKS v5" is disabled: Firefox may send a
 	// literal IPv6 address for gmail.google.com even though the tunnel is IPv4-only.
 	if ip := net.ParseIP(strings.Trim(host, "[]")); ip != nil {
 		if !r.ipAllowedByTunnel(ip) {
-			return nil, fmt.Errorf("direct IP target %s is not usable with %s; enable Firefox 'Proxy DNS when using SOCKS v5' or configure IPv6 in WireGuard", host, r.explainIPMode())
+			return nil, "literal", fmt.Errorf("direct IP target %s is not usable with %s; enable Firefox 'Proxy DNS when using SOCKS v5' or configure IPv6 in WireGuard", host, r.explainIPMode())
 		}
-		return []string{strings.Trim(host, "[]")}, nil
+		return []string{strings.Trim(host, "[]")}, "literal", nil
 	}
 
 	// Host override takes priority over cache and DNS
 	if ip := r.matchOverride(host); ip != "" {
-		return []string{ip}, nil
+		return []string{ip}, "host-override", nil
 	}
 
 	if cached, ok := r.cache.get(host); ok {
-		return cached, nil
+		return cached, "cache", nil
 	}
 
 	rctx, cancel := context.WithTimeout(ctx, 5*time.Second)
@@ -615,18 +828,51 @@ func (r *Resolver) Resolve(ctx context.Context, host string) ([]string, error) {
 
 	addrs, err := r.resolverForGo().LookupHost(rctx, host)
 	if err != nil {
-		return nil, err
+		return nil, "tunnel-dns", err
 	}
 	if len(addrs) == 0 {
-		return nil, fmt.Errorf("no addresses for %s", host)
+		return nil, "tunnel-dns", fmt.Errorf("no addresses for %s", host)
 	}
 	addrs = r.orderResolvedAddrs(addrs)
 	r.cache.put(host, addrs)
-	return addrs, nil
+	return addrs, "tunnel-dns", nil
 }
 
-// DialHostPort resolves host via WG DNS and dials through WG.
-func (r *Resolver) DialHostPort(ctx context.Context, hostport string) (net.Conn, error) {
+// Resolve preserves the existing WireGuard-only resolver API.
+func (r *Resolver) Resolve(ctx context.Context, host string) ([]string, error) {
+	addrs, _, err := r.resolveWireGuard(ctx, host)
+	return addrs, err
+}
+
+func resolveDirect(ctx context.Context, host string) ([]string, string, error) {
+	host = strings.Trim(host, "[]")
+	if net.ParseIP(host) != nil {
+		return []string{host}, "literal", nil
+	}
+	rctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	addrs, err := net.DefaultResolver.LookupHost(rctx, host)
+	if err != nil {
+		return nil, "system-dns", err
+	}
+	if len(addrs) == 0 {
+		return nil, "system-dns", fmt.Errorf("no addresses for %s", host)
+	}
+	return addrs, "system-dns", nil
+}
+
+// DialHostPort selects the configured outbound route, then resolves and dials
+// entirely through that path. Direct routing uses system DNS and networking;
+// WireGuard routing uses the tunnel DNS and netstack.
+func (r *Resolver) DialHostPort(ctx context.Context, reqID uint32, hostport string) (net.Conn, error) {
+	activeDials.Add(1)
+	defer activeDials.Add(-1)
+	tr, done := registerRoutine("outbound-dial", reqID, hostport)
+	defer done()
+	if tr != nil {
+		tr.setState("parse target")
+	}
+
 	host, port, err := net.SplitHostPort(hostport)
 	if err != nil {
 		return nil, err
@@ -634,27 +880,57 @@ func (r *Resolver) DialHostPort(ctx context.Context, hostport string) (net.Conn,
 	// net.SplitHostPort normally removes IPv6 brackets, but be defensive because
 	// older SOCKS5 code accidentally passed pre-bracketed IPv6 strings.
 	host = strings.Trim(host, "[]")
-	ips, err := r.Resolve(ctx, host)
-	if err != nil {
-		return nil, fmt.Errorf("resolve %s: %w", host, err)
+	action, rule := r.matchRoute(host)
+	logf("REQ-%05d | ROUTE  | %s via=%s rule=%s", reqID, hostport, action, rule)
+	if tr != nil {
+		tr.setState("resolve " + string(action))
 	}
 
-	// Happy-eyeballs-lite: try each IP in order. The order is already filtered
-	// by orderResolvedAddrs(), normally IPv4-first for IPv4 WG tunnels.
+	resolveStarted := time.Now()
+	var ips []string
+	var source string
+	if action == routeDirect {
+		ips, source, err = resolveDirect(ctx, host)
+	} else {
+		ips, source, err = r.resolveWireGuard(ctx, host)
+	}
+	resolveDuration := time.Since(resolveStarted)
+	if err != nil {
+		logf("REQ-%05d | DNS    | host=%s route=%s source=%s dur=%v error=%v",
+			reqID, host, action, source, resolveDuration.Truncate(time.Millisecond), err)
+		return nil, fmt.Errorf("resolve %s: %w", host, err)
+	}
+	logf("REQ-%05d | DNS    | host=%s route=%s source=%s dur=%v addrs=%v",
+		reqID, host, action, source, resolveDuration.Truncate(time.Millisecond), ips)
+
 	var lastErr error
 	attempted := make([]string, 0, len(ips))
 	for _, ip := range ips {
 		addr := net.JoinHostPort(ip, port)
 		attempted = append(attempted, addr)
+		if tr != nil {
+			tr.setState("connect " + addr)
+		}
 		dctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		c, err := r.tnet.DialContext(dctx, "tcp", addr)
+		started := time.Now()
+		var c net.Conn
+		if action == routeDirect {
+			c, err = r.direct.DialContext(dctx, "tcp", addr)
+		} else {
+			c, err = r.tnet.DialContext(dctx, "tcp", addr)
+		}
+		duration := time.Since(started)
 		cancel()
 		if err == nil {
+			logf("REQ-%05d | DIAL   | route=%s addr=%s dur=%v result=connected",
+				reqID, action, addr, duration.Truncate(time.Millisecond))
 			return c, nil
 		}
+		logf("REQ-%05d | DIAL   | route=%s addr=%s dur=%v result=failed error=%v",
+			reqID, action, addr, duration.Truncate(time.Millisecond), err)
 		lastErr = err
 	}
-	return nil, fmt.Errorf("dial %s via %v: %w", hostport, attempted, lastErr)
+	return nil, fmt.Errorf("dial %s via %s %v: %w", hostport, action, attempted, lastErr)
 }
 
 // ─── Request ID counter ──────────────────────────────────────────────────────
@@ -673,6 +949,9 @@ func nextReqID() uint32 {
 // activeRelays tracks how many relay() goroutines are currently running.
 // Used by diagLoop for observability; zero behavior impact.
 var activeRelays atomic.Int64
+var activeHTTPHandlers atomic.Int64
+var activeSOCKSHandlers atomic.Int64
+var activeDials atomic.Int64
 
 // debugConsoleEnabled gates all foreground-only diagnostics. Normal/systemd
 // startup leaves this false, so there is no stdin menu, routine registry table,
@@ -783,11 +1062,29 @@ var copyBufPool = sync.Pool{
 	},
 }
 
-func copyBuffered(dst io.Writer, src io.Reader) (int64, error) {
+func copyBuffered(dst io.Writer, src io.Reader, onFirstData func()) (int64, error) {
 	bp := copyBufPool.Get().(*[]byte)
-	n, err := io.CopyBuffer(dst, src, *bp)
-	copyBufPool.Put(bp)
-	return n, err
+	defer copyBufPool.Put(bp)
+	var total int64
+	first := true
+	for {
+		n, readErr := src.Read(*bp)
+		if n > 0 {
+			if first {
+				first = false
+				if onFirstData != nil {
+					onFirstData()
+				}
+			}
+			if err := writeFull(dst, (*bp)[:n]); err != nil {
+				return total, err
+			}
+			total += int64(n)
+		}
+		if readErr != nil {
+			return total, readErr
+		}
+	}
 }
 
 // ─── Tunnel relay (bidirectional copy) ───────────────────────────────────────
@@ -867,7 +1164,7 @@ func closeWrite(c net.Conn) error {
 //     Remote->Browser lane is allowed to keep draining the download body.
 //   - Remote->Browser completion/error, non-EOF upload errors, or shared tunnel
 //     idle timeout still close both sockets to unblock the opposite lane.
-func relay(id uint32, label, host string, client net.Conn, clientReader io.Reader, remote net.Conn) {
+func relay(id uint32, label, host string, client net.Conn, clientReader io.Reader, remote net.Conn, requestStarted time.Time) {
 	tr, done := registerRoutine("relay", id, host)
 	defer done()
 	if tr != nil {
@@ -887,12 +1184,14 @@ func relay(id uint32, label, host string, client net.Conn, clientReader io.Reade
 	// for Java/IntelliJ CONNECT downloads. A clean EOF must not hard-close the
 	// remote-to-client response path.
 	goTracked("relay-upload", id, host, func(lane *trackedRoutine) {
-		doneCh <- copyStreaming(remote, clientReader, remote, client, activity, "Browser->Remote", lane)
+		doneCh <- copyStreaming(remote, clientReader, remote, client, activity, "Browser->Remote", lane, nil)
 	})
 
 	// Lane 2: Remote -> Browser (Download).
 	goTracked("relay-download", id, host, func(lane *trackedRoutine) {
-		doneCh <- copyStreaming(client, remote, client, remote, activity, "Remote->Browser", lane)
+		doneCh <- copyStreaming(client, remote, client, remote, activity, "Remote->Browser", lane, func() {
+			logf("REQ-%05d | FIRST  | %s %s dur=%v", id, label, host, time.Since(requestStarted).Truncate(time.Millisecond))
+		})
 	})
 
 	if tr != nil {
@@ -922,8 +1221,8 @@ func relay(id uint32, label, host string, client net.Conn, clientReader io.Reade
 		select {
 		case res := <-doneCh:
 			doneCount++
-			logf("REQ-%05d | TUNNEL | lane-done %s %s dir=%s bytes=%d dur=%v reason=%s",
-				id, label, host, res.direction, res.bytes, res.duration.Truncate(time.Millisecond), res.reason())
+			logf("REQ-%05d | TUNNEL | lane-done %s %s dir=%s bytes=%d dur=%v rate_bps=%d reason=%s",
+				id, label, host, res.direction, res.bytes, res.duration.Truncate(time.Millisecond), bytesPerSecond(res.bytes, res.duration), res.reason())
 
 			if res.direction == "Browser->Remote" && res.cleanEOF() && !closed {
 				if tr != nil {
@@ -977,10 +1276,18 @@ func writeFull(dst io.Writer, p []byte) error {
 // not set per-lane read deadlines. Actual tunnel lifetime is controlled by
 // relay() using shared activity across both lanes; the watchdog closes the raw
 // sockets to unblock these reads.
-func copyStreaming(dst io.Writer, src io.Reader, rawDst net.Conn, rawSrc net.Conn, activity *relayActivity, direction string, tr *trackedRoutine) relayResult {
+func bytesPerSecond(bytes int64, duration time.Duration) int64 {
+	if bytes <= 0 || duration <= 0 {
+		return 0
+	}
+	return int64(float64(bytes) / duration.Seconds())
+}
+
+func copyStreaming(dst io.Writer, src io.Reader, rawDst net.Conn, rawSrc net.Conn, activity *relayActivity, direction string, tr *trackedRoutine, onFirstData func()) relayResult {
 	buf := make([]byte, 4096)
 	started := time.Now()
 	var total int64
+	firstData := true
 
 	if tr != nil {
 		tr.setState("read " + direction)
@@ -989,6 +1296,12 @@ func copyStreaming(dst io.Writer, src io.Reader, rawDst net.Conn, rawSrc net.Con
 	for {
 		nr, rerr := src.Read(buf)
 		if nr > 0 {
+			if firstData {
+				firstData = false
+				if onFirstData != nil {
+					onFirstData()
+				}
+			}
 			activity.touch()
 			if tr != nil {
 				tr.setState("write " + direction)
@@ -1160,9 +1473,14 @@ func cleanRequest(raw []byte) []byte {
 }
 
 // ─── HTTP proxy handler ───────────────────────────────────────────────────────
-func handleHTTP(r *Resolver, client net.Conn) {
+func handleHTTP(r *Resolver, client net.Conn, id uint32, tr *trackedRoutine) {
 	defer client.Close()
-	id := nextReqID()
+	activeHTTPHandlers.Add(1)
+	defer activeHTTPHandlers.Add(-1)
+	requestStarted := time.Now()
+	if tr != nil {
+		tr.setState("read request")
+	}
 
 	// FIX: Prevent speculative pre-connections from freezing the proxy
 	_ = client.SetReadDeadline(time.Now().Add(15 * time.Second))
@@ -1173,10 +1491,14 @@ func handleHTTP(r *Resolver, client net.Conn) {
 	}
 
 	method, host := parseMethodHost(raw)
+	if tr != nil {
+		tr.setHost(host)
+		tr.setState("outbound dial")
+	}
 	logf("REQ-%05d | HTTP   | %s %s", id, method, host)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	remote, err := r.DialHostPort(ctx, host)
+	remote, err := r.DialHostPort(ctx, id, host)
 	cancel()
 	if err != nil {
 		logf("REQ-%05d | ERR    | dial %s: %v", id, host, err)
@@ -1189,6 +1511,9 @@ func handleHTTP(r *Resolver, client net.Conn) {
 	tuneTCP(remote)
 
 	if method == "CONNECT" {
+		if tr != nil {
+			tr.setState("relay")
+		}
 		if err := writeFull(client, []byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
 			remote.Close()
 			return
@@ -1200,20 +1525,26 @@ func handleHTTP(r *Resolver, client net.Conn) {
 			clientReader = io.MultiReader(bytes.NewReader(leftover), client)
 		}
 
-		relay(id, "HTTP", host, client, clientReader, remote)
+		relay(id, "HTTP", host, client, clientReader, remote, requestStarted)
 	} else {
 		if err := writeFull(remote, cleanRequest(raw)); err != nil {
 			logf("REQ-%05d | ERR    | plain-http request write %s: %v", id, host, err)
 			remote.Close()
 			return
 		}
-		n, err := copyBuffered(client, remote)
+		copyStarted := time.Now()
+		n, err := copyBuffered(client, remote, func() {
+			logf("REQ-%05d | FIRST  | HTTP %s dur=%v", id, host, time.Since(requestStarted).Truncate(time.Millisecond))
+		})
+		copyDuration := time.Since(copyStarted)
 		remote.Close()
 		if err != nil && !errors.Is(err, io.EOF) {
-			logf("REQ-%05d | ERR    | plain-http response copy %s bytes=%d: %v", id, host, n, err)
+			logf("REQ-%05d | ERR    | plain-http response copy %s bytes=%d dur=%v rate_bps=%d: %v",
+				id, host, n, copyDuration.Truncate(time.Millisecond), bytesPerSecond(n, copyDuration), err)
 			return
 		}
-		logf("REQ-%05d | DONE   | %s bytes=%d", id, host, n)
+		logf("REQ-%05d | DONE   | %s bytes=%d dur=%v rate_bps=%d",
+			id, host, n, copyDuration.Truncate(time.Millisecond), bytesPerSecond(n, copyDuration))
 	}
 }
 
@@ -1229,9 +1560,14 @@ func writeSOCKS5Reply(client net.Conn, rep byte) error {
 	return writeFull(client, []byte{0x05, rep, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 }
 
-func handleSOCKS5(r *Resolver, client net.Conn) {
+func handleSOCKS5(r *Resolver, client net.Conn, id uint32, tr *trackedRoutine) {
 	defer client.Close()
-	id := nextReqID()
+	activeSOCKSHandlers.Add(1)
+	defer activeSOCKSHandlers.Add(-1)
+	requestStarted := time.Now()
+	if tr != nil {
+		tr.setState("SOCKS handshake")
+	}
 
 	// FIX: Prevent speculative pre-connections from freezing the proxy
 	_ = client.SetReadDeadline(time.Now().Add(15 * time.Second))
@@ -1327,9 +1663,13 @@ func handleSOCKS5(r *Resolver, client net.Conn) {
 	_ = client.SetReadDeadline(time.Time{})
 
 	logf("REQ-%05d | SOCKS5 | CONNECT %s", id, target)
+	if tr != nil {
+		tr.setHost(target)
+		tr.setState("outbound dial")
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	remote, err := r.DialHostPort(ctx, target)
+	remote, err := r.DialHostPort(ctx, id, target)
 	cancel()
 	if err != nil {
 		logf("REQ-%05d | ERR    | SOCKS5 dial %s: %v", id, target, err)
@@ -1350,7 +1690,10 @@ func handleSOCKS5(r *Resolver, client net.Conn) {
 	_ = client.SetReadDeadline(time.Time{})
 	// SOCKS5 doesn't swallow bytes, so we pass the `client` socket twice
 	// (once as the raw socket, once as the io.Reader)
-	relay(id, "SOCKS5", target, client, client, remote)
+	if tr != nil {
+		tr.setState("relay")
+	}
+	relay(id, "SOCKS5", target, client, client, remote, requestStarted)
 }
 
 // ─── Listeners ────────────────────────────────────────────────────────────────
@@ -1366,7 +1709,8 @@ func serveHTTP(ln net.Listener, r *Resolver) {
 			time.Sleep(50 * time.Millisecond)
 			continue
 		}
-		goTracked("http-handler", 0, c.RemoteAddr().String(), func(tr *trackedRoutine) { handleHTTP(r, c) })
+		id := nextReqID()
+		goTracked("http-handler", id, c.RemoteAddr().String(), func(tr *trackedRoutine) { handleHTTP(r, c, id, tr) })
 	}
 }
 
@@ -1381,19 +1725,19 @@ func serveSOCKS5(ln net.Listener, r *Resolver) {
 			time.Sleep(50 * time.Millisecond)
 			continue
 		}
-		goTracked("socks5-handler", 0, c.RemoteAddr().String(), func(tr *trackedRoutine) { handleSOCKS5(r, c) })
+		id := nextReqID()
+		goTracked("socks5-handler", id, c.RemoteAddr().String(), func(tr *trackedRoutine) { handleSOCKS5(r, c, id, tr) })
 	}
 }
 
 // ─── Diagnostics ──────────────────────────────────────────────────────────────
 //
-// Two loops, both observation-only (zero impact on request paths):
+// Two loops, both observation-only:
 //
 //   diagLoop         — every 60s, logs goroutine count, active relays,
 //                      DNS cache size, WG last-handshake age, WG rx/tx delta.
-//   tunnelHealthLoop — every 5 min, does a TCP handshake to 1.1.1.1:443
-//                      through the tunnel and logs RTT. After 3 consecutive
-//                      failures, emits a loud ALERT line. No auto-rebuild.
+//   tunnelHealthLoop — every 5 min, independently probes ICMP, tunnel DNS,
+//                      TCP, and a small HTTPS response through WireGuard.
 //
 // Purpose: when the proxy goes stale after hours/days of uptime, the log
 // should show which subsystem died (goroutine leak, WG handshake wedge, or
@@ -1449,6 +1793,8 @@ func diagLoop(dev *device.Device, resolver *Resolver) {
 
 	for range t.C {
 		s := readWGStats(dev)
+		var mem runtime.MemStats
+		runtime.ReadMemStats(&mem)
 
 		var dRx, dTx uint64
 		if !first {
@@ -1470,61 +1816,154 @@ func diagLoop(dev *device.Device, resolver *Resolver) {
 			hsAge = age.Truncate(time.Second).String()
 		}
 
-		logf("SYS | DIAG  | goroutines=%d relays=%d dns_cache=%d wg_hs_age=%s wg_rx_delta=%d wg_tx_delta=%d",
+		logf("SYS | DIAG  | goroutines=%d http=%d socks5=%d dials=%d relays=%d dns_cache=%d heap=%d heap_sys=%d gc=%d gc_pause_last_ns=%d wg_hs_age=%s wg_rx_delta=%d wg_tx_delta=%d",
 			runtime.NumGoroutine(),
+			activeHTTPHandlers.Load(),
+			activeSOCKSHandlers.Load(),
+			activeDials.Load(),
 			activeRelays.Load(),
 			resolver.cache.size(),
+			mem.HeapAlloc,
+			mem.HeapSys,
+			mem.NumGC,
+			latestGCPause(&mem),
 			hsAge,
 			dRx, dTx,
 		)
 	}
 }
 
-// tunnelHealthLoop probes the tunnel every 5 minutes by opening a TCP
-// connection to 1.1.1.1:443 through gVisor+WG, then immediately closing it.
-// Cheap, honest liveness signal. Logs RTT on success; on 3 consecutive
-// failures emits a loud ALERT line (but does NOT attempt to rebuild WG —
-// that decision waits until we've seen a real failure in the log).
-func tunnelHealthLoop(tnet *netstack.Net) {
+func latestGCPause(mem *runtime.MemStats) uint64 {
+	if mem.NumGC == 0 {
+		return 0
+	}
+	return mem.PauseNs[(mem.NumGC+255)%256]
+}
+
+type healthResult struct {
+	At       time.Time
+	OK       bool
+	Duration time.Duration
+	Detail   string
+	Streak   int
+}
+
+var healthResults = struct {
+	sync.Mutex
+	items map[string]healthResult
+}{items: make(map[string]healthResult)}
+
+func recordHealth(layer string, started time.Time, err error, detail string) {
+	result := healthResult{At: time.Now(), OK: err == nil, Duration: time.Since(started), Detail: detail}
+	if err != nil {
+		result.Detail = detail + " error=" + err.Error()
+	}
+	healthResults.Lock()
+	if err != nil {
+		result.Streak = healthResults.items[layer].Streak + 1
+	}
+	healthResults.items[layer] = result
+	healthResults.Unlock()
+	status := "OK"
+	if err != nil {
+		status = "FAIL"
+	}
+	logf("SYS | HEALTH| layer=%s result=%s streak=%d dur=%v detail=%s",
+		layer, status, result.Streak, result.Duration.Truncate(time.Millisecond), result.Detail)
+	if result.Streak == 3 {
+		logf("SYS | ALERT | health layer %s failed 3 consecutive times", layer)
+	}
+}
+
+func snapshotHealth() map[string]healthResult {
+	healthResults.Lock()
+	defer healthResults.Unlock()
+	out := make(map[string]healthResult, len(healthResults.items))
+	for k, v := range healthResults.items {
+		out[k] = v
+	}
+	return out
+}
+
+// tunnelHealthLoop independently probes ICMP, tunnel DNS, TCP, and HTTPS once
+// after startup and every 5 minutes. It reports failures but never rebuilds or
+// restarts the tunnel automatically.
+func tunnelHealthLoop(tnet *netstack.Net, resolver *Resolver) {
 	const (
-		interval    = 5 * time.Minute
-		probeTarget = "1.1.1.1:443"
-		dialTimeout = 8 * time.Second
-		alertAfter  = 3
+		interval  = 5 * time.Minute
+		probeHost = "one.one.one.one"
+		probePort = "443"
 	)
 
-	t := time.NewTicker(interval)
-	defer t.Stop()
+	timer := time.NewTimer(0)
+	defer timer.Stop()
+	for {
+		<-timer.C
 
-	failStreak := 0
-	for range t.C {
-		ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
-		start := time.Now()
-		c, err := tnet.DialContext(ctx, "tcp", probeTarget)
-		rtt := time.Since(start)
+		started := time.Now()
+		_, pingErr := debugPingOnce(tnet, "1.1.1.1", 2*time.Second)
+		recordHealth("wireguard-icmp", started, pingErr, "1.1.1.1")
+
+		started = time.Now()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		addrs, dnsErr := resolver.resolverForGo().LookupHost(ctx, probeHost)
 		cancel()
+		if dnsErr == nil {
+			addrs = resolver.orderResolvedAddrs(addrs)
+		}
+		recordHealth("wireguard-dns", started, dnsErr, fmt.Sprintf("%s -> %v", probeHost, addrs))
 
-		if err != nil {
-			failStreak++
-			logf("SYS | HEALTH| probe %s FAIL (streak=%d) after %v: %v",
-				probeTarget, failStreak, rtt.Truncate(time.Millisecond), err)
-			if failStreak == alertAfter {
-				logf("SYS | ALERT | tunnel appears unhealthy: %d consecutive probe failures — manual restart may be required",
-					failStreak)
+		if dnsErr == nil && len(addrs) > 0 {
+			addr := net.JoinHostPort(addrs[0], probePort)
+			started = time.Now()
+			ctx, cancel = context.WithTimeout(context.Background(), 8*time.Second)
+			conn, tcpErr := tnet.DialContext(ctx, "tcp", addr)
+			cancel()
+			if conn != nil {
+				_ = conn.Close()
 			}
-			continue
-		}
-		_ = c.Close()
+			recordHealth("wireguard-tcp", started, tcpErr, addr)
 
-		if failStreak > 0 {
-			logf("SYS | HEALTH| probe %s OK rtt=%v (recovered after %d failure(s))",
-				probeTarget, rtt.Truncate(time.Millisecond), failStreak)
+			started = time.Now()
+			httpsErr := probeHTTPS(tnet, addr, probeHost)
+			recordHealth("wireguard-https", started, httpsErr, probeHost)
 		} else {
-			logf("SYS | HEALTH| probe %s OK rtt=%v",
-				probeTarget, rtt.Truncate(time.Millisecond))
+			err := dnsErr
+			if err == nil {
+				err = errors.New("DNS returned no usable addresses")
+			}
+			recordHealth("wireguard-tcp", time.Now(), err, probeHost)
+			recordHealth("wireguard-https", time.Now(), err, probeHost)
 		}
-		failStreak = 0
+
+		timer.Reset(interval)
 	}
+}
+
+func probeHTTPS(tnet *netstack.Net, addr, serverName string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	raw, err := tnet.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return err
+	}
+	defer raw.Close()
+	_ = raw.SetDeadline(time.Now().Add(10 * time.Second))
+	tlsConn := tls.Client(raw, &tls.Config{ServerName: serverName, MinVersion: tls.VersionTLS12})
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
+		return err
+	}
+	if err := writeFull(tlsConn, []byte("HEAD / HTTP/1.1\r\nHost: "+serverName+"\r\nConnection: close\r\n\r\n")); err != nil {
+		return err
+	}
+	line, err := bufio.NewReader(tlsConn).ReadString('\n')
+	if err != nil {
+		return err
+	}
+	if !strings.HasPrefix(line, "HTTP/") {
+		return fmt.Errorf("unexpected response %q", strings.TrimSpace(line))
+	}
+	return nil
 }
 
 // ─── Debug console and ICMP ping (opt-in) ────────────────────────────────────
@@ -1654,12 +2093,16 @@ func debugPingLoop(tnet *netstack.Net) {
 
 func printSummary(dev *device.Device, resolver *Resolver) {
 	s := readWGStats(dev)
+	var mem runtime.MemStats
+	runtime.ReadMemStats(&mem)
 	hsAge := "never"
 	if s.lastHandshakeUnix != 0 {
 		hsAge = time.Since(time.Unix(s.lastHandshakeUnix, 0)).Truncate(time.Second).String()
 	}
-	fmt.Printf("goroutines=%d relays=%d tracked=%d dns_cache=%d wg_hs_age=%s wg_rx=%d wg_tx=%d\n",
-		runtime.NumGoroutine(), activeRelays.Load(), len(snapshotRoutines()), resolver.cache.size(), hsAge, s.rxBytes, s.txBytes)
+	fmt.Printf("goroutines=%d http=%d socks5=%d dials=%d relays=%d tracked=%d dns_cache=%d heap=%d heap_sys=%d gc=%d gc_pause_last_ns=%d wg_hs_age=%s wg_rx=%d wg_tx=%d\n",
+		runtime.NumGoroutine(), activeHTTPHandlers.Load(), activeSOCKSHandlers.Load(), activeDials.Load(),
+		activeRelays.Load(), len(snapshotRoutines()), resolver.cache.size(), mem.HeapAlloc, mem.HeapSys,
+		mem.NumGC, latestGCPause(&mem), hsAge, s.rxBytes, s.txBytes)
 }
 
 func printRoutines() {
@@ -1702,8 +2145,60 @@ func writeGoroutineDump() error {
 	return nil
 }
 
+func writeDiagnosticSnapshot(dev *device.Device, resolver *Resolver) error {
+	name := "diagnostic-" + time.Now().Format("20060102-150405") + ".txt"
+	f, err := os.Create(name)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	now := time.Now()
+	s := readWGStats(dev)
+	var mem runtime.MemStats
+	runtime.ReadMemStats(&mem)
+	hsAge := "never"
+	if s.lastHandshakeUnix != 0 {
+		hsAge = time.Since(time.Unix(s.lastHandshakeUnix, 0)).Truncate(time.Second).String()
+	}
+	fmt.Fprintf(f, "splice-proxy diagnostic snapshot at %s\n\n", now.Format(time.RFC3339))
+	fmt.Fprintf(f, "runtime goroutines=%d http=%d socks5=%d dials=%d relays=%d tracked=%d\n",
+		runtime.NumGoroutine(), activeHTTPHandlers.Load(), activeSOCKSHandlers.Load(), activeDials.Load(), activeRelays.Load(), len(snapshotRoutines()))
+	fmt.Fprintf(f, "memory heap_alloc=%d heap_sys=%d stack_inuse=%d num_gc=%d gc_pause_last_ns=%d\n",
+		mem.HeapAlloc, mem.HeapSys, mem.StackInuse, mem.NumGC, latestGCPause(&mem))
+	fmt.Fprintf(f, "network dns_cache=%d wg_hs_age=%s wg_rx=%d wg_tx=%d\n\n",
+		resolver.cache.size(), hsAge, s.rxBytes, s.txBytes)
+
+	fmt.Fprintln(f, "health:")
+	health := snapshotHealth()
+	layers := make([]string, 0, len(health))
+	for layer := range health {
+		layers = append(layers, layer)
+	}
+	sort.Strings(layers)
+	for _, layer := range layers {
+		result := health[layer]
+		fmt.Fprintf(f, "  %s at=%s ok=%v streak=%d dur=%v detail=%s\n",
+			layer, result.At.Format(time.RFC3339), result.OK, result.Streak, result.Duration.Truncate(time.Millisecond), result.Detail)
+	}
+
+	fmt.Fprintln(f, "\nroutines:")
+	for _, it := range snapshotRoutines() {
+		fmt.Fprintf(f, "  id=%d req=%d type=%s host=%s start=%s age=%v idle=%v bytes=%d state=%s\n",
+			it.ID, it.ReqID, it.Name, it.Host, it.Start.Format(time.RFC3339),
+			now.Sub(it.Start).Truncate(time.Second), now.Sub(it.Last).Truncate(time.Second), it.Bytes, it.State)
+	}
+
+	fmt.Fprintln(f, "\ngoroutines:")
+	if err := pprof.Lookup("goroutine").WriteTo(f, 2); err != nil {
+		return err
+	}
+	fmt.Printf("wrote %s\n", name)
+	return nil
+}
+
 func debugConsoleLoop(tnet *netstack.Net, dev *device.Device, resolver *Resolver) {
-	fmt.Println("\nDebug console enabled. Commands: h=help, s=summary, r=routines, d=dump goroutines, p=ping now, q=exit now")
+	fmt.Println("\nDebug console enabled. Commands: h=help, s=summary, r=routines, x=diagnostic snapshot, d=dump goroutines, p=ping now, q=exit now")
 	sc := bufio.NewScanner(os.Stdin)
 	for {
 		fmt.Print("splice-proxy> ")
@@ -1713,7 +2208,7 @@ func debugConsoleLoop(tnet *netstack.Net, dev *device.Device, resolver *Resolver
 		cmd := strings.ToLower(strings.TrimSpace(sc.Text()))
 		switch cmd {
 		case "", "h", "help", "?":
-			fmt.Println("Commands: s=summary, r=routines with START/AGE/IDLE, d=write full goroutine dump, p=ICMP ping now, q=exit now")
+			fmt.Println("Commands: s=summary, r=routines with START/AGE/IDLE, x=diagnostic snapshot, d=write full goroutine dump, p=ICMP ping now, q=exit now")
 		case "s", "summary":
 			printSummary(dev, resolver)
 		case "r", "routines":
@@ -1721,6 +2216,10 @@ func debugConsoleLoop(tnet *netstack.Net, dev *device.Device, resolver *Resolver
 		case "d", "dump":
 			if err := writeGoroutineDump(); err != nil {
 				fmt.Printf("dump failed: %v\n", err)
+			}
+		case "x", "snapshot":
+			if err := writeDiagnosticSnapshot(dev, resolver); err != nil {
+				fmt.Printf("snapshot failed: %v\n", err)
 			}
 		case "p", "ping":
 			res, err := debugPingOnce(tnet, "1.1.1.1", 2*time.Second)
@@ -1778,6 +2277,11 @@ func main() {
 	logf("SYS | INFO  | wg peer: %s", cfg.WGPeerEndpoint)
 	logf("SYS | INFO  | wg ip  : %v", cfg.WGLocalIPs)
 	logf("SYS | INFO  | dns    : %v (cache=%v)", cfg.DNSServers, cfg.DNSCacheTTL)
+	logf("SYS | INFO  | routing: default=%s rules=%d", cfg.DefaultRoute, len(cfg.Routes))
+	logf("SYS | INFO  | route reload: %v", cfg.RouteReload)
+	for host, action := range cfg.Routes {
+		logf("SYS | INFO  |          %s -> %s", host, action)
+	}
 	if debugConsole {
 		logf("SYS | INFO  | debug console enabled: stdin menu + tracked routine start times + 5s ICMP ping")
 	}
@@ -1795,8 +2299,11 @@ func main() {
 	}
 	logf("SYS | READY | wireguard up")
 
-	resolver := newResolver(tnet, cfg.DNSServers, cfg.DNSCacheTTL, cfg.HostOverrides, cfg.WGLocalIPs)
+	resolver := newResolver(tnet, cfg.DNSServers, cfg.DNSCacheTTL, cfg.HostOverrides, cfg.WGLocalIPs, cfg.DefaultRoute, cfg.Routes)
 	logf("SYS | INFO  | ip mode: ipv4=%v ipv6=%v dns_order=ipv4-first", resolver.allowIPv4, resolver.allowIPv6)
+	if cfg.RouteReload > 0 {
+		goTracked("route-reload-loop", 0, cfgPath, func(tr *trackedRoutine) { routeReloadLoop(cfgPath, resolver, cfg.RouteReload) })
+	}
 
 	httpLn, err := net.Listen("tcp", cfg.HTTPListen)
 	if err != nil {
@@ -1815,7 +2322,7 @@ func main() {
 	goTracked("http-accept", 0, cfg.HTTPListen, func(tr *trackedRoutine) { serveHTTP(httpLn, resolver) })
 	goTracked("socks5-accept", 0, cfg.SOCKS5Listen, func(tr *trackedRoutine) { serveSOCKS5(socksLn, resolver) })
 	goTracked("diag-loop", 0, "", func(tr *trackedRoutine) { diagLoop(dev, resolver) })
-	goTracked("tcp-health-loop", 0, "1.1.1.1:443", func(tr *trackedRoutine) { tunnelHealthLoop(tnet) })
+	goTracked("layered-health-loop", 0, "one.one.one.one:443", func(tr *trackedRoutine) { tunnelHealthLoop(tnet, resolver) })
 	if debugConsole {
 		goTracked("debug-ping-loop", 0, "1.1.1.1", func(tr *trackedRoutine) { debugPingLoop(tnet) })
 		goTracked("debug-console", 0, "stdin", func(tr *trackedRoutine) { debugConsoleLoop(tnet, dev, resolver) })

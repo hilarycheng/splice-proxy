@@ -13,6 +13,26 @@
 http_listen   = 127.0.0.1:12346
 socks5_listen = 127.0.0.1:12348
 
+[routing]
+; Route used when no hostname rule below matches.
+; Valid values: wireguard, direct
+default = wireguard
+
+; 0 disables reload; a positive value polls config.ini at this interval.
+; New rules affect new connections. Existing tunnels keep their original route.
+reload_interval_seconds = 0
+
+[routes]
+; Per-host outbound routing. Exact matches take priority over wildcards, and
+; the longest wildcard suffix wins. A wildcard does not match the bare domain.
+;
+; Direct routes use system DNS and the normal local network. WireGuard routes
+; use the DNS servers below and the embedded tunnel.
+;
+; example.com         = direct
+; *.example.com       = direct
+; secure.example.com  = wireguard
+
 [wireguard]
 ; Your client's private key (base64).
 private_key = PUT_YOUR_PRIVATE_KEY_HERE=
@@ -60,8 +80,8 @@ cache_ttl_seconds = 300
 [hosts]
 ; Custom IP overrides — bypass DNS for specific domains.
 ; Exact matches take priority over wildcards. Longest wildcard suffix wins.
-; These overrides apply ONLY to traffic going through this proxy — they do
-; not affect the OS or other applications.
+; These overrides apply only to WireGuard routes. Direct routes always use
+; system DNS. They do not affect the OS or other applications.
 ;
 ; Examples (uncomment and edit as needed):
 ;

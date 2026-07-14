@@ -12,6 +12,160 @@ Browser ←TCP→ Proxy Server ←RUDP/UDP→ Proxy Worker ←TCP→ Internet (v
 
 **Constraint:** Due to Symantec Endpoint Protection on Windows, the container/WSL worker can only connect to the host on localhost/local IPs. TCP connections at scale break WSL networking, so UDP is used between server and worker with a custom Reliable UDP (RUDP) protocol.
 
+## Selective Outbound Routing
+
+Some company/internal hosts are reachable only through the machine's local
+network and system DNS, while selected public or private hosts must continue to
+use WireGuard. Some HTTP and SOCKS5 clients cannot configure their own proxy
+exceptions, so this decision must be made inside Splice-Proxy.
+
+The configuration uses one routing table with two actions:
+
+```ini
+[routing]
+default = wireguard
+reload_interval_seconds = 0
+
+[routes]
+example.com         = direct
+*.example.com       = direct
+secure.example.com  = wireguard
+```
+
+### Rule Selection
+
+1. Exact hostname match.
+2. Longest wildcard suffix match.
+3. The `routing.default` action.
+
+This precedence permits a WireGuard exception such as `secure.example.com`
+inside a direct wildcard such as `*.example.com`. A wildcard does not match the
+bare domain, so `example.com` and `*.example.com` are separate rules.
+
+### Outbound Paths
+
+- **direct:** Resolve with the operating system resolver and connect with the
+  normal system network. Do not use the configured tunnel DNS servers or the
+  WireGuard netstack.
+- **wireguard:** Preserve the current behavior: resolve through the configured
+  WireGuard DNS servers and connect through the embedded WireGuard netstack.
+
+DNS results and connection attempts must remain associated with their selected
+path so a direct lookup or connection cannot accidentally use WireGuard, and a
+WireGuard lookup cannot leak to system DNS.
+
+### Protocol Constraint
+
+HTTP CONNECT and SOCKS5 have no standard response that means "retry this target
+directly." Rejecting a proxied request only reports failure. PAC files, browser
+bypass lists, and `NO_PROXY` make the decision on the client before contacting
+the proxy, but are unavailable in some target tools. Splice-Proxy must therefore
+accept the request and perform the direct connection on the client's behalf.
+
+Hostname routing is possible only when the client sends a hostname. A SOCKS5
+request containing a literal IPv4 or IPv6 address cannot be mapped back reliably
+to its original domain. IP/CIDR routing is outside this initial requirement.
+
+### Dynamic Route Reload
+
+Route reload uses standard-library polling so it works on Windows and Linux
+without adding a filesystem-watcher dependency. The interval is configured
+with `routing.reload_interval_seconds`; `0` disables reload.
+
+On a detected content change, the proxy parses only `[routing]` and
+`[routes]`, validates a complete immutable rule set, and atomically replaces the
+active rule set. A partial or invalid update must not replace the last valid
+configuration and must produce a clear log entry.
+
+Content must be identical on two consecutive successful reads before parsing and
+activation. This stability check protects against normal editors that briefly
+truncate and rewrite the file in place.
+
+Reload semantics:
+
+- New outbound connections use the new table immediately after activation.
+- Existing HTTP CONNECT and SOCKS5 tunnels remain on their original path.
+- Deleted rules fall back to the current `routing.default` value.
+- WireGuard keys, tunnel DNS, host overrides, and listen addresses are not
+  dynamically reloaded.
+- File content changes must be detected without relying only on modification
+  time, which can have limited resolution or remain unchanged after replacement.
+- If a reload changes the interval to `0`, the watcher stops. Restart is required
+  to enable it again.
+
+## Layered Connection Diagnostics
+
+### Problem
+
+The proxy can sometimes stop connecting or become slow until it is restarted,
+even while the WireGuard ICMP ping continues to succeed. ICMP confirms only that
+the tunnel and gVisor ICMP path are alive. It does not validate tunnel DNS,
+outbound TCP, destination response time, proxy handlers, or relay throughput.
+
+The previous health check tested only one TCP handshake every five minutes. The
+layered checks now separate ICMP, DNS, TCP, and HTTPS response health. They still
+use a fixed reference destination and do not replace per-request measurements for
+an affected destination.
+
+### Required Per-Request Measurements
+
+Each request keeps one request ID across the HTTP/SOCKS handler, route selection,
+DNS, outbound dial, and relay. Logs include:
+
+- selected route and matched rule;
+- DNS cache hit/miss, lookup duration, and returned addresses;
+- duration and result of each outbound TCP connection attempt;
+- selected destination IP;
+- time from accepted proxy request to first response byte;
+- bytes, duration, and average transfer rate for each relay direction;
+- close reason and the stage that produced an error.
+
+Hostnames and addresses are already present in normal request logs. Diagnostics
+must not log payloads, credentials, private keys, or proxy authorization values.
+
+### Layered Health Probes
+
+Health results remain separate so one successful layer cannot hide a failure
+in another:
+
+1. WireGuard handshake age and byte counters.
+2. ICMP echo through WireGuard.
+3. DNS lookup through the configured tunnel DNS server.
+4. TCP connection through the WireGuard netstack.
+5. TLS handshake and small HTTPS response measuring response time.
+6. Direct-route system DNS and TCP timing from real direct requests.
+
+The active WireGuard probes run once after startup and every five minutes with
+short independent timeouts. They do not automatically restart the proxy.
+
+### Runtime Snapshot
+
+When `--debug-console` is enabled, command `x` captures a timestamped
+`diagnostic-*.txt` snapshot before manual restart containing:
+
+- active HTTP handlers, SOCKS5 handlers, outbound dials, and relays;
+- routine state, request ID, host, age, idle time, and byte count;
+- goroutine count and full goroutine stacks;
+- Go heap allocation, heap reservation, GC count, and latest GC pause;
+- tunnel DNS cache size;
+- WireGuard handshake age and RX/TX counters;
+- latest result and latency for every health-probe layer.
+
+The snapshot is observation-only. Existing connections are not closed or
+modified while it is collected.
+
+### Failure Classification
+
+| Observation | Likely failing layer |
+| --- | --- |
+| ICMP succeeds but TCP probe fails | gVisor/WireGuard TCP path |
+| TCP succeeds but tunnel DNS fails | Tunnel DNS path |
+| DNS and TCP succeed but first byte is slow | Destination, CDN, or TLS/application path |
+| First byte is fast but transfer rate degrades | Relay, congestion, or packet-loss path |
+| Handler, dial, relay, memory, or goroutine counts continually grow | Resource or routine leak |
+| Only existing browser traffic is slow and reconnect fixes it | Stale CONNECT/SOCKS tunnel |
+| All traffic improves only after process restart | Accumulated netstack or process state |
+
 ## Components (3 files)
 
 ### rudp.go — Reliable UDP Library
