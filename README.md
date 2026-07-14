@@ -55,12 +55,12 @@ Routing behavior:
   literal IP address, only an exact IP rule can match because the proxy cannot
   recover the original hostname.
 
-The system hosts file is read at startup for route classification. Each valid
-line may contain one IP followed by multiple hostname aliases; blank lines,
-comments, and malformed entries are ignored. The proxy then uses the operating
-system resolver for the direct connection, preserving native handling of
-duplicate names, multiple addresses, and address ordering. Restart Splice-Proxy
-after changing the system hosts file.
+The system hosts file is read at startup and periodically reloaded for route
+classification. Each valid line may contain one IP followed by multiple
+hostname aliases; blank lines, comments, and malformed entries are ignored. The
+proxy then uses the operating system resolver for the direct connection,
+preserving native handling of duplicate names, multiple addresses, and address
+ordering.
 
 ### Static Host Overrides
 
@@ -84,19 +84,19 @@ Therefore, the proxy must make the selected direct connection itself. Client-sid
 PAC, proxy bypass lists, and `NO_PROXY` remain alternatives for clients that
 support them.
 
-### Dynamic Route Reload
+### Dynamic Route and Hosts Reload
 
-`routing.reload_interval_seconds` controls periodic route reloads. `0`
-disables reload. When enabled, Splice-Proxy rereads only `[routing]` and
-`[routes]`, validates a complete new routing table, and atomically activates it.
-Invalid updates will be logged while the last valid table remains active.
-Changed content must be identical on two consecutive polls before activation,
-which prevents a temporary partial write from becoming live configuration.
+`routing.reload_interval_seconds` controls periodic route and system hosts file
+reloads. `0` disables reload. When enabled, Splice-Proxy rereads `[routing]`,
+`[routes]`, and the operating system hosts file, then atomically activates valid
+updates. Read or validation failures are logged while the last valid data
+remains active. Changed content must be identical on two consecutive polls
+before activation, which prevents a temporary partial write from becoming live.
 
 Reloaded rules will apply to new connections only. Existing HTTP CONNECT and
 SOCKS5 tunnels will keep their selected route until they disconnect. WireGuard
-settings, DNS servers, proxy listen addresses, and host overrides will remain
-startup-only settings.
+settings, DNS servers, proxy listen addresses, and `[hosts]` static overrides
+will remain startup-only settings.
 
 Changing the interval to `0` during reload stops the watcher. Restart is needed
 to enable it again because a disabled watcher cannot observe later file changes.

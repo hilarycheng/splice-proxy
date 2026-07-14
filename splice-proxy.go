@@ -515,12 +515,13 @@ func (c *dnsCache) size() int {
 
 // Resolver resolves hostnames through the WG tunnel.
 type Resolver struct {
-	tnet    *netstack.Net
-	servers []string
-	cache   *dnsCache
-	nextSrv atomic.Uint32
-	direct  net.Dialer
-	routes  atomic.Pointer[routeRuleSet]
+	tnet          *netstack.Net
+	servers       []string
+	cache         *dnsCache
+	nextSrv       atomic.Uint32
+	direct        net.Dialer
+	routes        atomic.Pointer[routeRuleSet]
+	systemHostsMu sync.RWMutex
 
 	// Address-family mode comes from configured WG local IPs.
 	// If the tunnel has only IPv4 local addresses, avoid using IPv6 DNS answers
@@ -623,12 +624,12 @@ func newResolver(tnet *netstack.Net, servers []string, ttl time.Duration, overri
 			KeepAlive: 30 * time.Second,
 			Resolver:  net.DefaultResolver,
 		},
-		allowIPv4:   allowIPv4,
-		allowIPv6:   allowIPv6,
-		exactHosts:  make(map[string]string),
-		systemHosts: systemHosts,
+		allowIPv4:  allowIPv4,
+		allowIPv6:  allowIPv6,
+		exactHosts: make(map[string]string),
 	}
 	r.replaceRoutes(defaultRoute, routes)
+	r.replaceSystemHosts(systemHosts)
 	for host, ip := range overrides {
 		host = strings.ToLower(host)
 		if strings.HasPrefix(host, "*.") {
@@ -651,6 +652,12 @@ func (r *Resolver) replaceRoutes(defaultAction routeAction, routes map[string]ro
 	r.routes.Store(&rules)
 }
 
+func (r *Resolver) replaceSystemHosts(hosts map[string]struct{}) {
+	r.systemHostsMu.Lock()
+	r.systemHosts = hosts
+	r.systemHostsMu.Unlock()
+}
+
 func (r *Resolver) matchRoute(host string) (routeAction, string) {
 	rules := r.routes.Load()
 	if rules == nil {
@@ -671,7 +678,9 @@ func (r *Resolver) isSystemHost(host string) bool {
 	if ip, err := netip.ParseAddr(strings.Trim(host, "[]")); err == nil {
 		return ip.IsLoopback()
 	}
+	r.systemHostsMu.RLock()
 	_, ok := r.systemHosts[host]
+	r.systemHostsMu.RUnlock()
 	return ok
 }
 
@@ -714,14 +723,16 @@ func systemHostsFilePath() string {
 // loadSystemHostnames reads hosts-file aliases for route classification only.
 // The direct resolver still decides which address to use, preserving OS rules.
 func loadSystemHostnames(path string) (map[string]struct{}, error) {
-	f, err := os.Open(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	return parseSystemHostnames(data)
+}
 
+func parseSystemHostnames(data []byte) (map[string]struct{}, error) {
 	hosts := make(map[string]struct{})
-	scanner := bufio.NewScanner(f)
+	scanner := bufio.NewScanner(bytes.NewReader(data))
 	scanner.Buffer(make([]byte, 4096), 1024*1024)
 	for scanner.Scan() {
 		line, _, _ := strings.Cut(scanner.Text(), "#")
@@ -745,34 +756,38 @@ func loadSystemHostnames(path string) (map[string]struct{}, error) {
 	return hosts, nil
 }
 
-func routeReloadLoop(path string, resolver *Resolver, initialInterval time.Duration) {
+func reloadLoop(configPath, systemHostsPath string, resolver *Resolver, initialInterval time.Duration) {
 	interval := initialInterval
 	timer := time.NewTimer(0)
 	defer timer.Stop()
 
-	var observedHash, processedHash [sha256.Size]byte
-	haveObserved := false
-	haveProcessed := false
-	stableReads := 0
+	var routeObservedHash, routeProcessedHash [sha256.Size]byte
+	routeHaveObserved := false
+	routeHaveProcessed := false
+	routeStableReads := 0
+	var hostsObservedHash, hostsProcessedHash [sha256.Size]byte
+	hostsHaveObserved := false
+	hostsHaveProcessed := false
+	hostsStableReads := 0
 	for {
 		<-timer.C
-		data, err := os.ReadFile(path)
+		data, err := os.ReadFile(configPath)
 		if err != nil {
 			logf("SYS | ROUTE | reload read failed; keeping last valid routes: %v", err)
-			haveObserved = false
-			stableReads = 0
+			routeHaveObserved = false
+			routeStableReads = 0
 		} else {
 			hash := sha256.Sum256(data)
-			if !haveObserved || hash != observedHash {
-				haveObserved = true
-				observedHash = hash
-				stableReads = 1
+			if !routeHaveObserved || hash != routeObservedHash {
+				routeHaveObserved = true
+				routeObservedHash = hash
+				routeStableReads = 1
 			} else {
-				stableReads++
+				routeStableReads++
 			}
-			if stableReads >= 2 && (!haveProcessed || hash != processedHash) {
-				haveProcessed = true
-				processedHash = hash
+			if routeStableReads >= 2 && (!routeHaveProcessed || hash != routeProcessedHash) {
+				routeHaveProcessed = true
+				routeProcessedHash = hash
 				defaultRoute, routes, nextInterval, parseErr := parseRoutingConfig(parseIniData(data))
 				if parseErr != nil {
 					logf("SYS | ROUTE | reload rejected; keeping last valid routes: %v", parseErr)
@@ -783,6 +798,33 @@ func routeReloadLoop(path string, resolver *Resolver, initialInterval time.Durat
 						interval = nextInterval
 						logf("SYS | ROUTE | reload interval changed to %v", interval)
 					}
+				}
+			}
+		}
+
+		hostsData, hostsErr := os.ReadFile(systemHostsPath)
+		if hostsErr != nil {
+			logf("SYS | HOSTS | reload read failed; keeping last valid hosts: %v", hostsErr)
+			hostsHaveObserved = false
+			hostsStableReads = 0
+		} else {
+			hash := sha256.Sum256(hostsData)
+			if !hostsHaveObserved || hash != hostsObservedHash {
+				hostsHaveObserved = true
+				hostsObservedHash = hash
+				hostsStableReads = 1
+			} else {
+				hostsStableReads++
+			}
+			if hostsStableReads >= 2 && (!hostsHaveProcessed || hash != hostsProcessedHash) {
+				hostsHaveProcessed = true
+				hostsProcessedHash = hash
+				hosts, parseErr := parseSystemHostnames(hostsData)
+				if parseErr != nil {
+					logf("SYS | HOSTS | reload rejected; keeping last valid hosts: %v", parseErr)
+				} else {
+					resolver.replaceSystemHosts(hosts)
+					logf("SYS | HOSTS | reloaded names=%d", len(hosts))
 				}
 			}
 		}
@@ -2388,7 +2430,7 @@ func main() {
 	logf("SYS | INFO  | wg ip  : %v", cfg.WGLocalIPs)
 	logf("SYS | INFO  | dns    : %v (cache=%v)", cfg.DNSServers, cfg.DNSCacheTTL)
 	logf("SYS | INFO  | routing: default=%s rules=%d", cfg.DefaultRoute, len(cfg.Routes))
-	logf("SYS | INFO  | route reload: %v", cfg.RouteReload)
+	logf("SYS | INFO  | route/hosts reload: %v", cfg.RouteReload)
 	for host, action := range cfg.Routes {
 		logf("SYS | INFO  |          %s -> %s", host, action)
 	}
@@ -2419,7 +2461,9 @@ func main() {
 	resolver := newResolver(tnet, cfg.DNSServers, cfg.DNSCacheTTL, cfg.HostOverrides, systemHosts, cfg.WGLocalIPs, cfg.DefaultRoute, cfg.Routes)
 	logf("SYS | INFO  | ip mode: ipv4=%v ipv6=%v dns_order=ipv4-first", resolver.allowIPv4, resolver.allowIPv6)
 	if cfg.RouteReload > 0 {
-		goTracked("route-reload-loop", 0, cfgPath, func(tr *trackedRoutine) { routeReloadLoop(cfgPath, resolver, cfg.RouteReload) })
+		goTracked("route-hosts-reload-loop", 0, cfgPath, func(tr *trackedRoutine) {
+			reloadLoop(cfgPath, systemHostsPath, resolver, cfg.RouteReload)
+		})
 	}
 
 	httpLn, err := net.Listen("tcp", cfg.HTTPListen)
