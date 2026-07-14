@@ -548,8 +548,10 @@ type routeRuleSet struct {
 }
 
 type routeWildcardEntry struct {
-	suffix string
-	action routeAction
+	suffix   string
+	pattern  string
+	action   routeAction
+	explicit bool
 }
 
 func newRouteRuleSet(defaultAction routeAction, routes map[string]routeAction) routeRuleSet {
@@ -560,15 +562,30 @@ func newRouteRuleSet(defaultAction routeAction, routes map[string]routeAction) r
 	for pattern, action := range routes {
 		if strings.HasPrefix(pattern, "*.") {
 			r.wildcards = append(r.wildcards, routeWildcardEntry{
-				suffix: pattern[1:],
-				action: action,
+				suffix:   pattern[1:],
+				pattern:  pattern,
+				action:   action,
+				explicit: true,
 			})
 			continue
 		}
 		r.exact[pattern] = action
+		if net.ParseIP(pattern) != nil {
+			continue
+		}
+		r.wildcards = append(r.wildcards, routeWildcardEntry{
+			suffix:  "." + pattern,
+			pattern: pattern,
+			action:  action,
+		})
 	}
 	sort.Slice(r.wildcards, func(i, j int) bool {
-		return len(r.wildcards[i].suffix) > len(r.wildcards[j].suffix)
+		if len(r.wildcards[i].suffix) != len(r.wildcards[j].suffix) {
+			return len(r.wildcards[i].suffix) > len(r.wildcards[j].suffix)
+		}
+		// Preserve the meaning of an explicitly configured wildcard when a
+		// bare domain rule covers the same suffix.
+		return r.wildcards[i].explicit && !r.wildcards[j].explicit
 	})
 	return r
 }
@@ -585,7 +602,7 @@ func (r routeRuleSet) matchDetail(host string) (routeAction, string) {
 	}
 	for _, rule := range r.wildcards {
 		if strings.HasSuffix(host, rule.suffix) {
-			return rule.action, "*" + rule.suffix
+			return rule.action, rule.pattern
 		}
 	}
 	return r.defaultAction, "default"
@@ -635,6 +652,22 @@ func (r *Resolver) matchRoute(host string) (routeAction, string) {
 		return routeWireGuard, "default"
 	}
 	return rules.matchDetail(host)
+}
+
+// selectRoute first matches the requested hostname. When no hostname rule
+// matches, a static [hosts] IP may select an exact IP route before the default.
+func (r *Resolver) selectRoute(host string) (routeAction, string, string) {
+	action, rule := r.matchRoute(host)
+	staticIP := r.matchOverride(host)
+	if rule != "default" || staticIP == "" {
+		return action, rule, staticIP
+	}
+
+	ipAction, ipRule := r.matchRoute(staticIP)
+	if ipRule != "default" {
+		return ipAction, ipRule, staticIP
+	}
+	return action, rule, staticIP
 }
 
 func routeReloadLoop(path string, resolver *Resolver, initialInterval time.Duration) {
@@ -880,7 +913,7 @@ func (r *Resolver) DialHostPort(ctx context.Context, reqID uint32, hostport stri
 	// net.SplitHostPort normally removes IPv6 brackets, but be defensive because
 	// older SOCKS5 code accidentally passed pre-bracketed IPv6 strings.
 	host = strings.Trim(host, "[]")
-	action, rule := r.matchRoute(host)
+	action, rule, staticIP := r.selectRoute(host)
 	logf("REQ-%05d | ROUTE  | %s via=%s rule=%s", reqID, hostport, action, rule)
 	if tr != nil {
 		tr.setState("resolve " + string(action))
@@ -889,7 +922,9 @@ func (r *Resolver) DialHostPort(ctx context.Context, reqID uint32, hostport stri
 	resolveStarted := time.Now()
 	var ips []string
 	var source string
-	if action == routeDirect {
+	if staticIP != "" {
+		ips, source = []string{staticIP}, "host-override"
+	} else if action == routeDirect {
 		ips, source, err = resolveDirect(ctx, host)
 	} else {
 		ips, source, err = r.resolveWireGuard(ctx, host)

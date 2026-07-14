@@ -27,22 +27,40 @@ reload_interval_seconds = 0
 
 [routes]
 example.com         = direct
-*.example.com       = direct
 secure.example.com  = wireguard
+192.0.2.10          = direct
 ```
 
 Routing behavior:
 
-- An exact hostname rule wins over a wildcard rule.
-- The longest matching wildcard wins; otherwise `routing.default` is used.
-- `direct` resolves with the operating system DNS configuration and connects
-  through the normal local network, completely bypassing WireGuard.
+- A domain rule matches the domain itself and all of its subdomains. For
+  example, `example.com` also matches `a.example.com` and `a.b.example.com`.
+- The longest matching domain wins; otherwise `routing.default` is used.
+- `direct` uses a matching `[hosts]` static IP or the operating system DNS, then
+  connects through the normal local network, completely bypassing WireGuard.
 - `wireguard` resolves with the configured tunnel DNS servers and connects
   through the embedded WireGuard stack.
-- `*.example.com` matches subdomains but not `example.com`; add both rules when
-  both must use the same route.
+- Domain matching respects label boundaries, so `example.com` does not match
+  `notexample.com`.
+- A literal IP rule matches only that exact IP. CIDR and netmask route rules,
+  such as `192.168.0.0/16`, are not supported.
 - Host rules require the client to send a hostname. If a SOCKS5 client sends a
-  literal IP address, the proxy cannot recover the original hostname.
+  literal IP address, only an exact IP rule can match because the proxy cannot
+  recover the original hostname.
+
+### Static Host Overrides
+
+The `[hosts]` section only maps a hostname to a static IP address. Route
+selection follows this order:
+
+1. Match the requested hostname in `[routes]`.
+2. If unmatched and `[hosts]` supplies a static IP, match that exact IP in
+   `[routes]`.
+3. If still unmatched, use `routing.default`, which is `wireguard` when omitted.
+
+The static IP is used for the connection regardless of the selected route.
+Hosts not defined in `[hosts]` skip step 2; the proxy does not perform DNS merely
+to choose a route.
 
 An HTTP or SOCKS5 proxy cannot send a standard response that tells a client to
 retry one request directly. A rejected request is normally just a failure.

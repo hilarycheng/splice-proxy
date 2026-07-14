@@ -28,31 +28,40 @@ reload_interval_seconds = 0
 
 [routes]
 example.com         = direct
-*.example.com       = direct
 secure.example.com  = wireguard
+192.0.2.10          = direct
 ```
 
 ### Rule Selection
 
-1. Exact hostname match.
-2. Longest wildcard suffix match.
-3. The `routing.default` action.
+1. Longest matching domain rule.
+2. The `routing.default` action.
 
-This precedence permits a WireGuard exception such as `secure.example.com`
-inside a direct wildcard such as `*.example.com`. A wildcard does not match the
-bare domain, so `example.com` and `*.example.com` are separate rules.
+Each domain rule matches the domain itself and all descendant subdomains.
+For example, `example.com` matches `example.com`, `a.example.com`, and
+`a.b.example.com`, but not `notexample.com`. Longest-domain precedence permits
+a WireGuard exception such as `secure.example.com` inside the direct
+`example.com` rule.
+
+A literal IP rule matches only that exact address. CIDR and netmask route rules
+are not supported.
 
 ### Outbound Paths
 
-- **direct:** Resolve with the operating system resolver and connect with the
-  normal system network. Do not use the configured tunnel DNS servers or the
-  WireGuard netstack.
+- **direct:** Use a matching `[hosts]` static IP or resolve with the operating
+  system resolver, then connect with the normal system network. Do not use the
+  configured tunnel DNS servers or the WireGuard netstack.
 - **wireguard:** Preserve the current behavior: resolve through the configured
   WireGuard DNS servers and connect through the embedded WireGuard netstack.
 
 DNS results and connection attempts must remain associated with their selected
 path so a direct lookup or connection cannot accidentally use WireGuard, and a
 WireGuard lookup cannot leak to system DNS.
+
+For names in `[hosts]`, route selection first checks the hostname rule, then the
+mapped exact IP rule, then `routing.default`. The mapping supplies the connection
+IP on either route. Names without a static mapping skip the IP-rule step; DNS is
+not performed before route selection.
 
 ### Protocol Constraint
 
@@ -64,7 +73,8 @@ accept the request and perform the direct connection on the client's behalf.
 
 Hostname routing is possible only when the client sends a hostname. A SOCKS5
 request containing a literal IPv4 or IPv6 address cannot be mapped back reliably
-to its original domain. IP/CIDR routing is outside this initial requirement.
+to its original domain, but it can match an exact literal IP route. CIDR routing
+is outside this initial requirement.
 
 ### Dynamic Route Reload
 

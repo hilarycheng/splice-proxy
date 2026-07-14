@@ -23,15 +23,18 @@ default = wireguard
 reload_interval_seconds = 0
 
 [routes]
-; Per-host outbound routing. Exact matches take priority over wildcards, and
-; the longest wildcard suffix wins. A wildcard does not match the bare domain.
+; Per-domain outbound routing. A rule matches the domain itself and all of its
+; subdomains. The longest matching domain wins. Domain-label boundaries apply:
+; example.com matches a.b.example.com, but not notexample.com.
+; A literal IP rule matches only that exact IP. CIDR/netmask rules are not
+; supported (for example, 192.168.0.0/16 is not a valid route rule).
 ;
 ; Direct routes use system DNS and the normal local network. WireGuard routes
 ; use the DNS servers below and the embedded tunnel.
 ;
 ; example.com         = direct
-; *.example.com       = direct
 ; secure.example.com  = wireguard
+; 192.0.2.10          = direct
 
 [wireguard]
 ; Your client's private key (base64).
@@ -78,16 +81,19 @@ servers = 1.1.1.1:53, 1.0.0.1:53
 cache_ttl_seconds = 300
 
 [hosts]
-; Custom IP overrides — bypass DNS for specific domains.
+; Static hostname-to-IP mappings — bypass DNS for specific domains.
 ; Exact matches take priority over wildcards. Longest wildcard suffix wins.
-; These overrides apply only to WireGuard routes. Direct routes always use
-; system DNS. They do not affect the OS or other applications.
+; Routing checks the hostname in [routes] first, then this static IP in [routes],
+; then routing.default. The static IP is used with either direct or WireGuard.
+; Hosts without a mapping skip the IP-route check. These mappings do not affect
+; the OS or other applications.
 ;
 ; Examples (uncomment and edit as needed):
 ;
 ; # Exact match
 ; gemini.google.com    = 142.250.80.110
 ; broken-dns-site.com  = 203.0.113.42
+; legacy.internal      = 192.0.2.10  ; matches the direct IP route above
 ;
 ; # Wildcard — matches any subdomain of example.com, but NOT example.com itself
 ; *.example.com        = 192.0.2.10
