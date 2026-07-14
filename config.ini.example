@@ -31,6 +31,11 @@ reload_interval_seconds = 0
 ;
 ; Direct routes use system DNS and the normal local network. WireGuard routes
 ; use the DNS servers below and the embedded tunnel.
+; Hostnames found in the OS hosts file are automatically direct unless a
+; matching rule here overrides that behavior. The files are /etc/hosts on Linux
+; and %SystemRoot%\System32\drivers\etc\hosts on Windows. They are read at
+; startup; restart splice-proxy after changing them.
+; localhost, *.localhost, 127.0.0.0/8, and ::1 are also automatically direct.
 ;
 ; example.com         = direct
 ; secure.example.com  = wireguard

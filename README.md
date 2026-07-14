@@ -33,6 +33,13 @@ secure.example.com  = wireguard
 
 Routing behavior:
 
+- An explicit hostname rule in `[routes]` has the highest priority.
+- Hostnames listed in the operating system hosts file are automatically routed
+  `direct`. Linux uses `/etc/hosts`; Windows uses
+  `%SystemRoot%\System32\drivers\etc\hosts`.
+- `localhost`, subdomains of `localhost`, `127.0.0.0/8`, and `::1` are also
+  automatically routed `direct` unless an explicit hostname or IP rule overrides
+  them.
 - A domain rule matches the domain itself and all of its subdomains. For
   example, `example.com` also matches `a.example.com` and `a.b.example.com`.
 - The longest matching domain wins; otherwise `routing.default` is used.
@@ -48,18 +55,27 @@ Routing behavior:
   literal IP address, only an exact IP rule can match because the proxy cannot
   recover the original hostname.
 
+The system hosts file is read at startup for route classification. Each valid
+line may contain one IP followed by multiple hostname aliases; blank lines,
+comments, and malformed entries are ignored. The proxy then uses the operating
+system resolver for the direct connection, preserving native handling of
+duplicate names, multiple addresses, and address ordering. Restart Splice-Proxy
+after changing the system hosts file.
+
 ### Static Host Overrides
 
 The `[hosts]` section only maps a hostname to a static IP address. Route
 selection follows this order:
 
 1. Match the requested hostname in `[routes]`.
-2. If unmatched and `[hosts]` supplies a static IP, match that exact IP in
+2. If unmatched and the hostname is in the operating system hosts file, use
+   `direct`.
+3. If unmatched and `[hosts]` supplies a static IP, match that exact IP in
    `[routes]`.
-3. If still unmatched, use `routing.default`, which is `wireguard` when omitted.
+4. If still unmatched, use `routing.default`, which is `wireguard` when omitted.
 
 The static IP is used for the connection regardless of the selected route.
-Hosts not defined in `[hosts]` skip step 2; the proxy does not perform DNS merely
+Hosts not defined in `[hosts]` skip step 3; the proxy does not perform DNS merely
 to choose a route.
 
 An HTTP or SOCKS5 proxy cannot send a standard response that tells a client to

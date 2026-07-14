@@ -35,7 +35,10 @@ secure.example.com  = wireguard
 ### Rule Selection
 
 1. Longest matching domain rule.
-2. The `routing.default` action.
+2. A hostname in the operating system hosts file, or a built-in loopback target,
+   uses `direct`.
+3. A matching static `[hosts]` IP rule.
+4. The `routing.default` action.
 
 Each domain rule matches the domain itself and all descendant subdomains.
 For example, `example.com` matches `example.com`, `a.example.com`, and
@@ -58,10 +61,17 @@ DNS results and connection attempts must remain associated with their selected
 path so a direct lookup or connection cannot accidentally use WireGuard, and a
 WireGuard lookup cannot leak to system DNS.
 
-For names in `[hosts]`, route selection first checks the hostname rule, then the
-mapped exact IP rule, then `routing.default`. The mapping supplies the connection
-IP on either route. Names without a static mapping skip the IP-rule step; DNS is
-not performed before route selection.
+The operating system hosts file is parsed at startup for hostname membership.
+Linux uses `/etc/hosts`; Windows uses
+`%SystemRoot%\System32\drivers\etc\hosts`. One IP may have multiple aliases;
+comments, blank lines, and malformed entries are ignored. Matching names use the
+direct path, while the OS resolver remains responsible for their actual address
+selection. Explicit hostname rules take priority. Built-in loopback targets are
+handled the same way. Restart is required after changing the system hosts file.
+
+For names in `[hosts]`, the mapping supplies the connection IP on either route.
+Names without a static mapping skip the IP-rule step; DNS is not performed merely
+to choose a route.
 
 ### Protocol Constraint
 

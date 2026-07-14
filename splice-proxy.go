@@ -534,6 +534,10 @@ type Resolver struct {
 	// Wildcards are stored as "suffix" (e.g. ".example.com") and matched longest-first.
 	exactHosts    map[string]string // "gemini.google.com" -> "142.250.80.110"
 	wildcardHosts []wildcardEntry   // sorted by suffix length, descending
+
+	// systemHosts contains names declared in the operating system hosts file.
+	// It is used only for route selection; direct resolution remains the OS's job.
+	systemHosts map[string]struct{}
 }
 
 type wildcardEntry struct {
@@ -608,7 +612,7 @@ func (r routeRuleSet) matchDetail(host string) (routeAction, string) {
 	return r.defaultAction, "default"
 }
 
-func newResolver(tnet *netstack.Net, servers []string, ttl time.Duration, overrides map[string]string, localIPs []netip.Addr, defaultRoute routeAction, routes map[string]routeAction) *Resolver {
+func newResolver(tnet *netstack.Net, servers []string, ttl time.Duration, overrides map[string]string, systemHosts map[string]struct{}, localIPs []netip.Addr, defaultRoute routeAction, routes map[string]routeAction) *Resolver {
 	allowIPv4, allowIPv6 := addressFamilyMode(localIPs)
 	r := &Resolver{
 		tnet:    tnet,
@@ -619,9 +623,10 @@ func newResolver(tnet *netstack.Net, servers []string, ttl time.Duration, overri
 			KeepAlive: 30 * time.Second,
 			Resolver:  net.DefaultResolver,
 		},
-		allowIPv4:  allowIPv4,
-		allowIPv6:  allowIPv6,
-		exactHosts: make(map[string]string),
+		allowIPv4:   allowIPv4,
+		allowIPv6:   allowIPv6,
+		exactHosts:  make(map[string]string),
+		systemHosts: systemHosts,
 	}
 	r.replaceRoutes(defaultRoute, routes)
 	for host, ip := range overrides {
@@ -654,12 +659,34 @@ func (r *Resolver) matchRoute(host string) (routeAction, string) {
 	return rules.matchDetail(host)
 }
 
-// selectRoute first matches the requested hostname. When no hostname rule
-// matches, a static [hosts] IP may select an exact IP route before the default.
+func normalizeHostname(host string) string {
+	return strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
+}
+
+func (r *Resolver) isSystemHost(host string) bool {
+	host = normalizeHostname(host)
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return true
+	}
+	if ip, err := netip.ParseAddr(strings.Trim(host, "[]")); err == nil {
+		return ip.IsLoopback()
+	}
+	_, ok := r.systemHosts[host]
+	return ok
+}
+
+// selectRoute checks explicit routes first, then OS hosts-file membership,
+// then a static [hosts] IP route before falling back to the configured default.
 func (r *Resolver) selectRoute(host string) (routeAction, string, string) {
 	action, rule := r.matchRoute(host)
 	staticIP := r.matchOverride(host)
-	if rule != "default" || staticIP == "" {
+	if rule != "default" {
+		return action, rule, staticIP
+	}
+	if r.isSystemHost(host) {
+		return routeDirect, "system-hosts", staticIP
+	}
+	if staticIP == "" {
 		return action, rule, staticIP
 	}
 
@@ -668,6 +695,54 @@ func (r *Resolver) selectRoute(host string) (routeAction, string, string) {
 		return ipAction, ipRule, staticIP
 	}
 	return action, rule, staticIP
+}
+
+func systemHostsFilePath() string {
+	if runtime.GOOS != "windows" {
+		return "/etc/hosts"
+	}
+	root := os.Getenv("SystemRoot")
+	if root == "" {
+		root = os.Getenv("windir")
+	}
+	if root == "" {
+		root = `C:\Windows`
+	}
+	return strings.TrimRight(root, `\/`) + `\System32\drivers\etc\hosts`
+}
+
+// loadSystemHostnames reads hosts-file aliases for route classification only.
+// The direct resolver still decides which address to use, preserving OS rules.
+func loadSystemHostnames(path string) (map[string]struct{}, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	hosts := make(map[string]struct{})
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 4096), 1024*1024)
+	for scanner.Scan() {
+		line, _, _ := strings.Cut(scanner.Text(), "#")
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		if _, err := netip.ParseAddr(fields[0]); err != nil {
+			continue
+		}
+		for _, alias := range fields[1:] {
+			alias = normalizeHostname(alias)
+			if alias != "" {
+				hosts[alias] = struct{}{}
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return hosts, nil
 }
 
 func routeReloadLoop(path string, resolver *Resolver, initialInterval time.Duration) {
@@ -2326,6 +2401,13 @@ func main() {
 			logf("SYS | INFO  |         %s -> %s", host, ip)
 		}
 	}
+	systemHostsPath := systemHostsFilePath()
+	systemHosts, hostsErr := loadSystemHostnames(systemHostsPath)
+	if hostsErr != nil {
+		logf("SYS | WARN  | system hosts file unavailable (%s): %v", systemHostsPath, hostsErr)
+	} else {
+		logf("SYS | INFO  | system hosts: %d name(s) loaded from %s", len(systemHosts), systemHostsPath)
+	}
 
 	tnet, dev, err := setupWireGuard(cfg)
 	if err != nil {
@@ -2334,7 +2416,7 @@ func main() {
 	}
 	logf("SYS | READY | wireguard up")
 
-	resolver := newResolver(tnet, cfg.DNSServers, cfg.DNSCacheTTL, cfg.HostOverrides, cfg.WGLocalIPs, cfg.DefaultRoute, cfg.Routes)
+	resolver := newResolver(tnet, cfg.DNSServers, cfg.DNSCacheTTL, cfg.HostOverrides, systemHosts, cfg.WGLocalIPs, cfg.DefaultRoute, cfg.Routes)
 	logf("SYS | INFO  | ip mode: ipv4=%v ipv6=%v dns_order=ipv4-first", resolver.allowIPv4, resolver.allowIPv6)
 	if cfg.RouteReload > 0 {
 		goTracked("route-reload-loop", 0, cfgPath, func(tr *trackedRoutine) { routeReloadLoop(cfgPath, resolver, cfg.RouteReload) })
