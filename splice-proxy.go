@@ -1003,9 +1003,6 @@ func (r *Resolver) orderResolvedAddrs(addrs []string) []string {
 		out = append(out, v6...)
 	}
 	out = append(out, unknown...)
-	if len(out) == 0 {
-		return addrs
-	}
 	return out
 }
 
@@ -1091,6 +1088,9 @@ func (r *Resolver) resolveWireGuard(ctx context.Context, host string) ([]string,
 		return nil, "tunnel-dns", fmt.Errorf("no addresses for %s", host)
 	}
 	addrs = r.orderResolvedAddrs(addrs)
+	if len(addrs) == 0 {
+		return nil, "tunnel-dns", fmt.Errorf("no addresses usable with %s for %s", r.explainIPMode(), host)
+	}
 	r.cache.put(host, addrs)
 	return addrs, "tunnel-dns", nil
 }
