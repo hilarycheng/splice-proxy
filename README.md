@@ -112,9 +112,10 @@ not prove that DNS, TCP connection setup, proxy handlers, or relay throughput ar
 healthy. Splice-Proxy logs per-request timing for DNS, outbound TCP connect,
 first response byte, transferred bytes, and relay speed.
 
-Logs are written to the console and to a daily `splice-proxy-YYYY-MM-DD.log`
-file beside the executable. The current and previous calendar day's files are
-retained; older log files are removed at startup or midnight rotation.
+Logs are written to a daily `splice-proxy-YYYY-MM-DD.log` file beside the
+executable. Normal console output omits tunnel transfer-completion messages.
+The current and previous calendar day's files are retained; older log files
+are removed at startup or midnight rotation.
 
 Every five minutes, and once immediately after startup, independent health checks
 probe WireGuard ICMP, tunnel DNS, TCP connection setup, and a small HTTPS
@@ -128,7 +129,11 @@ behavior can be compared with the fresh process.
 Run with `--debug-console` and enter `l` to print the current sorted route rules
 and operating-system host names. The output identifies `/etc/hosts` on Linux or
 `%SystemRoot%\System32\drivers\etc\hosts` on Windows and reflects successful
-dynamic reloads. Enter `x` to write a timestamped
+dynamic reloads. Enter `v` to toggle console silence without affecting the log
+file. Enter `c` to print the last 500 outbound dial attempts from oldest to
+newest as a table containing date/time, count, proxy source (`HTTP` or
+`SOCKS5`), host, IP, selected route, and result. Consecutive identical attempts
+are combined into one row. Enter `x` to write a timestamped
 `diagnostic-*.txt` snapshot containing runtime counters, health results, tracked
 routines, and goroutine stacks. Request logs and snapshots never include traffic
 payloads, credentials, WireGuard private keys, or proxy authorization values.

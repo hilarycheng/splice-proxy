@@ -167,6 +167,15 @@ When `--debug-console` is enabled, command `l` prints the current sorted route
 rules and system-host names used for direct classification. The output includes
 the platform hosts-file path and reads the live state after successful reloads.
 
+Command `v` toggles console silence while full logging continues in the daily
+log file. Tunnel transfer-completion lines are omitted from normal console
+output even when silence is disabled.
+
+Command `c` prints an in-memory history of the last 500 outbound dial attempts
+from oldest to newest. Each row contains the latest timestamp and count for a
+consecutive group with the same proxy source (`HTTP` or `SOCKS5`), host, IP,
+route (`direct` or `wireguard`), and result (`connected` or `failed`).
+
 When `--debug-console` is enabled, command `x` captures a timestamped
 `diagnostic-*.txt` snapshot before manual restart containing:
 

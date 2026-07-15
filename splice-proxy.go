@@ -36,6 +36,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"text/tabwriter"
 	"time"
 	"unsafe"
 
@@ -51,6 +52,13 @@ import (
 // ─── Logging ──────────────────────────────────────────────────────────────────
 
 var lg = log.New(os.Stdout, "", 0)
+var consoleSilent atomic.Bool
+
+func isTransferLog(p []byte) bool {
+	return bytes.Contains(p, []byte(" | TUNNEL | lane-done ")) ||
+		bytes.Contains(p, []byte(" | TUNNEL | upload-eof ")) ||
+		bytes.Contains(p, []byte(" | TUNNEL | closed "))
+}
 
 type dailyLogWriter struct {
 	mu   sync.Mutex
@@ -75,7 +83,9 @@ func (w *dailyLogWriter) Write(p []byte) (int, error) {
 	if now.Format("2006-01-02") != w.day {
 		_ = w.rotate(now)
 	}
-	_, _ = os.Stdout.Write(p)
+	if !consoleSilent.Load() && !isTransferLog(p) {
+		_, _ = os.Stdout.Write(p)
+	}
 	if w.file != nil {
 		_, _ = w.file.Write(p)
 	}
@@ -172,6 +182,46 @@ const (
 	routeDirect    routeAction = "direct"
 	routeWireGuard routeAction = "wireguard"
 )
+
+const recentDialLimit = 500
+
+type dialRecord struct {
+	at     time.Time
+	source string
+	host   string
+	ip     string
+	route  routeAction
+	result string
+}
+
+var recentDials struct {
+	sync.Mutex
+	records [recentDialLimit]dialRecord
+	next    int
+	count   int
+}
+
+func recordDial(record dialRecord) {
+	recentDials.Lock()
+	record.at = time.Now()
+	recentDials.records[recentDials.next] = record
+	recentDials.next = (recentDials.next + 1) % recentDialLimit
+	if recentDials.count < recentDialLimit {
+		recentDials.count++
+	}
+	recentDials.Unlock()
+}
+
+func recentDialSnapshot() []dialRecord {
+	recentDials.Lock()
+	defer recentDials.Unlock()
+	records := make([]dialRecord, 0, recentDials.count)
+	start := (recentDials.next - recentDials.count + recentDialLimit) % recentDialLimit
+	for i := 0; i < recentDials.count; i++ {
+		records = append(records, recentDials.records[(start+i)%recentDialLimit])
+	}
+	return records
+}
 
 func parseRouteAction(value string) (routeAction, error) {
 	switch routeAction(strings.ToLower(strings.TrimSpace(value))) {
@@ -1121,7 +1171,7 @@ func resolveDirect(ctx context.Context, host string) ([]string, string, error) {
 // DialHostPort selects the configured outbound route, then resolves and dials
 // entirely through that path. Direct routing uses system DNS and networking;
 // WireGuard routing uses the tunnel DNS and netstack.
-func (r *Resolver) DialHostPort(ctx context.Context, reqID uint32, hostport string) (net.Conn, error) {
+func (r *Resolver) DialHostPort(ctx context.Context, reqID uint32, proxySource, hostport string) (net.Conn, error) {
 	activeDials.Add(1)
 	defer activeDials.Add(-1)
 	tr, done := registerRoutine("outbound-dial", reqID, hostport)
@@ -1188,10 +1238,12 @@ func (r *Resolver) DialHostPort(ctx context.Context, reqID uint32, hostport stri
 		duration := time.Since(started)
 		cancel()
 		if err == nil {
+			recordDial(dialRecord{source: proxySource, host: host, ip: ip, route: dialAction, result: "connected"})
 			logf("REQ-%05d | DIAL   | route=%s addr=%s dur=%v result=connected",
 				reqID, dialAction, addr, duration.Truncate(time.Millisecond))
 			return c, nil
 		}
+		recordDial(dialRecord{source: proxySource, host: host, ip: ip, route: dialAction, result: "failed"})
 		logf("REQ-%05d | DIAL   | route=%s addr=%s dur=%v result=failed error=%v",
 			reqID, dialAction, addr, duration.Truncate(time.Millisecond), err)
 		lastErr = err
@@ -1764,7 +1816,7 @@ func handleHTTP(r *Resolver, client net.Conn, id uint32, tr *trackedRoutine) {
 	logf("REQ-%05d | HTTP   | %s %s", id, method, host)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	remote, err := r.DialHostPort(ctx, id, host)
+	remote, err := r.DialHostPort(ctx, id, "HTTP", host)
 	cancel()
 	if err != nil {
 		logf("REQ-%05d | ERR    | dial %s: %v", id, host, err)
@@ -1935,7 +1987,7 @@ func handleSOCKS5(r *Resolver, client net.Conn, id uint32, tr *trackedRoutine) {
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	remote, err := r.DialHostPort(ctx, id, target)
+	remote, err := r.DialHostPort(ctx, id, "SOCKS5", target)
 	cancel()
 	if err != nil {
 		logf("REQ-%05d | ERR    | SOCKS5 dial %s: %v", id, target, err)
@@ -2500,8 +2552,38 @@ func printRouteAndSystemHosts(resolver *Resolver) {
 	}
 }
 
+func printRecentDials() {
+	type group struct {
+		dialRecord
+		count int
+	}
+	var groups []group
+	for _, record := range recentDialSnapshot() {
+		if len(groups) > 0 {
+			last := &groups[len(groups)-1]
+			if last.source == record.source && last.host == record.host && last.ip == record.ip && last.route == record.route && last.result == record.result {
+				last.at = record.at
+				last.count++
+				continue
+			}
+		}
+		groups = append(groups, group{dialRecord: record, count: 1})
+	}
+	if len(groups) == 0 {
+		fmt.Println("recent connections: empty")
+		return
+	}
+	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(w, "DATE TIME\tCOUNT\tSOURCE\tHOST\tIP\tROUTE\tRESULT")
+	for _, group := range groups {
+		fmt.Fprintf(w, "%s\t%d\t%s\t%s\t%s\t%s\t%s\n",
+			group.at.Format("2006-01-02 15:04:05.000"), group.count, group.source, group.host, group.ip, group.route, group.result)
+	}
+	_ = w.Flush()
+}
+
 func debugConsoleLoop(tnet *netstack.Net, dev *device.Device, resolver *Resolver) {
-	fmt.Println("\nDebug console enabled. Commands: h=help, s=summary, l=route/hosts lists, r=routines, x=diagnostic snapshot, d=dump goroutines, p=ping now, q=exit now")
+	fmt.Println("\nDebug console enabled. Commands: h=help, c=recent connections, v=toggle console silence, s=summary, l=route/hosts lists, r=routines, x=diagnostic snapshot, d=dump goroutines, p=ping now, q=exit now")
 	sc := bufio.NewScanner(os.Stdin)
 	for {
 		fmt.Print("splice-proxy> ")
@@ -2511,7 +2593,12 @@ func debugConsoleLoop(tnet *netstack.Net, dev *device.Device, resolver *Resolver
 		cmd := strings.ToLower(strings.TrimSpace(sc.Text()))
 		switch cmd {
 		case "", "h", "help", "?":
-			fmt.Println("Commands: s=summary, l=current route/system-host lists, r=routines with START/AGE/IDLE, x=diagnostic snapshot, d=write full goroutine dump, p=ICMP ping now, q=exit now")
+			fmt.Println("Commands: c=last 500 connections, v=toggle console silence, s=summary, l=current route/system-host lists, r=routines with START/AGE/IDLE, x=diagnostic snapshot, d=write full goroutine dump, p=ICMP ping now, q=exit now")
+		case "c", "connections":
+			printRecentDials()
+		case "v", "silent":
+			consoleSilent.Store(!consoleSilent.Load())
+			fmt.Printf("console silent: %v\n", consoleSilent.Load())
 		case "s", "summary":
 			printSummary(dev, resolver)
 		case "l", "lists":
