@@ -112,6 +112,10 @@ not prove that DNS, TCP connection setup, proxy handlers, or relay throughput ar
 healthy. Splice-Proxy logs per-request timing for DNS, outbound TCP connect,
 first response byte, transferred bytes, and relay speed.
 
+Logs are written to the console and to a daily `splice-proxy-YYYY-MM-DD.log`
+file beside the executable. The current and previous calendar day's files are
+retained; older log files are removed at startup or midnight rotation.
+
 Every five minutes, and once immediately after startup, independent health checks
 probe WireGuard ICMP, tunnel DNS, TCP connection setup, and a small HTTPS
 response. A successful layer does not hide a failure in another layer.

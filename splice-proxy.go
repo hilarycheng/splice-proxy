@@ -26,6 +26,7 @@ import (
 	"net/netip"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"reflect"
 	"runtime"
 	"runtime/pprof"
@@ -50,6 +51,77 @@ import (
 // ─── Logging ──────────────────────────────────────────────────────────────────
 
 var lg = log.New(os.Stdout, "", 0)
+
+type dailyLogWriter struct {
+	mu   sync.Mutex
+	dir  string
+	day  string
+	file *os.File
+}
+
+func newDailyLogWriter(dir string) (*dailyLogWriter, error) {
+	w := &dailyLogWriter{dir: dir}
+	if err := w.rotate(time.Now()); err != nil {
+		return nil, err
+	}
+	return w, nil
+}
+
+func (w *dailyLogWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	now := time.Now()
+	if now.Format("2006-01-02") != w.day {
+		_ = w.rotate(now)
+	}
+	_, _ = os.Stdout.Write(p)
+	if w.file != nil {
+		_, _ = w.file.Write(p)
+	}
+	return len(p), nil
+}
+
+func (w *dailyLogWriter) rotate(now time.Time) error {
+	if w.file != nil {
+		_ = w.file.Close()
+		w.file = nil
+	}
+	w.day = now.Format("2006-01-02")
+	cleanupOldLogs(w.dir, now)
+	f, err := os.OpenFile(filepath.Join(w.dir, "splice-proxy-"+w.day+".log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	w.file = f
+	return nil
+}
+
+func cleanupOldLogs(dir string, now time.Time) {
+	files, _ := filepath.Glob(filepath.Join(dir, "splice-proxy-????-??-??.log"))
+	oldest := now.AddDate(0, 0, -1).Format("2006-01-02")
+	for _, path := range files {
+		name := filepath.Base(path)
+		day := strings.TrimSuffix(strings.TrimPrefix(name, "splice-proxy-"), ".log")
+		if day < oldest {
+			_ = os.Remove(path)
+		}
+	}
+}
+
+func setupLogging() {
+	exe, err := os.Executable()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "log setup failed: %v\n", err)
+		return
+	}
+	w, err := newDailyLogWriter(filepath.Dir(exe))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "log setup failed: %v\n", err)
+		return
+	}
+	lg.SetOutput(w)
+}
 
 func logf(format string, args ...interface{}) {
 	lg.Printf(time.Now().Format("2006-01-02 15:04:05.000")+" | "+format, args...)
@@ -2493,6 +2565,7 @@ func parseArgs(args []string) bool {
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 func main() {
+	setupLogging()
 	cfgPath := "config.ini"
 	debugConsole := parseArgs(os.Args[1:])
 	debugConsoleEnabled.Store(debugConsole)
